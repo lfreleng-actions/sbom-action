@@ -242,6 +242,293 @@ jobs:
             echo "With development components: ${WITH_DEV_COUNT}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test the maven backend resolves a real dependency graph ###
+  # The syft backend reads pom.xml as text, which for Maven is an input
+  # to dependency resolution rather than a product of it: transitive
+  # dependencies are invisible and BOM-managed versions come back as
+  # UNKNOWN. This job asserts the maven backend recovers both.
+  # See lfreleng-actions/java-workflows#47.
+  test-maven-backend:
+    name: "Test: maven backend"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
+
+      # Block, like every other job here. Running a build tool that
+      # resolves arbitrary plugins under unrestricted egress would make
+      # this self-test an exfiltration surface, so this job is not
+      # dropped to audit.
+      #
+      # The allow-list pinned above already carries Maven Central
+      # (repo.maven.apache.org, repo1.maven.org) and the GitHub release
+      # hosts that serve JDK archives. It does not carry
+      # api.adoptium.net, which setup-java queries for Temurin build
+      # metadata, so that one endpoint is added here.
+      #
+      # To be clear about where the gap is: the organisation's global
+      # allow-list HAS carried api.adoptium.net since 'CI: Add Gradle
+      # and Temurin egress to allow-list', and ships it in v0.16.1.
+      # This workflow simply pins an older revision. The real fix is a
+      # pin bump, not an allow-list change, but that also needs
+      # harden-runner-block-action bumping: the pinned v0.2.1 reads a
+      # single space-separated line, whereas v0.16.1 of the list is
+      # multi-line with comments. Bumping both together (matching
+      # java-workflows, where that pairing is proven) belongs in its
+      # own change, and would additionally drop four entries this
+      # older list carries.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+            api.adoptium.net:443
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Multi-module reactor whose core module declares jackson-databind
+      # at compile scope with no version of its own, supplied by an
+      # imported jackson-bom. One declared coordinate, three resolved
+      # components.
+      - name: "Checkout test project: lfreleng-actions/test-maven-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-maven-project
+          # yamllint disable-line rule:line-length
+          ref: bf7b7ec62d40a04cffc8824cf691e6333972fcb1 # v0.1.0
+          path: test-project
+          persist-credentials: false
+
+      - name: "Running local action: maven backend"
+        id: maven
+        uses: ./
+        with:
+          backend: maven
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-maven
+
+      - name: "Running local action: maven backend with test scope"
+        id: maven-dev
+        uses: ./
+        with:
+          backend: maven
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-maven-dev
+          include_dev: 'true'
+
+      # The plugin cannot split formats across directories, so these two
+      # runs exercise the backend-specific placement logic: 'both'
+      # writes straight to the output directory, while 'xml' generates
+      # both into a scratch directory and moves only the XML across.
+      - name: "Running local action: maven backend, both formats"
+        id: maven-both
+        uses: ./
+        with:
+          backend: maven
+          path_prefix: test-project
+          sbom_format: both
+          filename_prefix: sbom-maven-both
+          output_directory: maven-both-out
+
+      - name: "Running local action: maven backend, XML only"
+        id: maven-xml
+        uses: ./
+        with:
+          backend: maven
+          path_prefix: test-project
+          sbom_format: xml
+          filename_prefix: sbom-maven-xml
+          output_directory: maven-xml-out
+
+      - name: "Running local action: maven_args override rejected"
+        id: maven-args-override
+        continue-on-error: true
+        uses: ./
+        with:
+          backend: maven
+          path_prefix: test-project
+          maven_args: '-DoutputDirectory=/tmp/escape'
+
+      # The plugin does not reject a schema version it cannot produce;
+      # it silently falls back to its own default. Without the
+      # post-generation check this run would report success over a
+      # document carrying a different version than the one requested.
+      - name: "Running local action: unsupported spec version"
+        id: maven-bad-spec
+        continue-on-error: true
+        uses: ./
+        with:
+          backend: maven
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-maven-badspec
+          sbom_spec_version: '9.9'
+
+      - name: "Verify the resolved dependency graph"
+        shell: bash
+        env:
+          MAVEN_JSON: ${{ steps.maven.outputs.sbom_json_path }}
+          MAVEN_COUNT: ${{ steps.maven.outputs.component_count }}
+          MAVEN_BACKEND: ${{ steps.maven.outputs.backend }}
+          DEV_JSON: ${{ steps.maven-dev.outputs.sbom_json_path }}
+          DEV_COUNT: ${{ steps.maven-dev.outputs.component_count }}
+          BOTH_JSON: ${{ steps.maven-both.outputs.sbom_json_path }}
+          BOTH_XML: ${{ steps.maven-both.outputs.sbom_xml_path }}
+          XML_ONLY_JSON: ${{ steps.maven-xml.outputs.sbom_json_path }}
+          XML_ONLY_XML: ${{ steps.maven-xml.outputs.sbom_xml_path }}
+          OVERRIDE_OUTCOME: ${{ steps.maven-args-override.outcome }}
+          BAD_SPEC_OUTCOME: ${{ steps.maven-bad-spec.outcome }}
+        run: |
+          # Verify the resolved dependency graph
+          errors=0
+          if [ "${MAVEN_BACKEND}" != "maven" ]; then
+            echo "Unexpected backend output: ${MAVEN_BACKEND} ❌"
+            errors=1
+          fi
+          if [ ! -f "${MAVEN_JSON}" ]; then
+            echo "Maven SBOM not found: ${MAVEN_JSON} ❌"
+            exit 1
+          fi
+          if ! jq -e '.bomFormat == "CycloneDX"' \
+            "${MAVEN_JSON}" > /dev/null; then
+            echo "Maven SBOM is not CycloneDX ❌"
+            errors=1
+          fi
+
+          # Transitive resolution: jackson-core is declared nowhere in
+          # the fixture's POMs and can only appear beneath
+          # jackson-databind, so its presence proves the graph was
+          # resolved rather than parsed
+          for artifact in jackson-databind jackson-core; do
+            if ! jq -e --arg name "${artifact}" \
+              '[.components[] | select(.name == $name)] | length > 0' \
+              "${MAVEN_JSON}" > /dev/null; then
+              echo "Transitive component missing: ${artifact} ❌"
+              errors=1
+            fi
+          done
+
+          # BOM-managed version resolution: a component without a
+          # usable version cannot be matched against a vulnerability
+          # database, so it is silently unscannable
+          unresolved=$(jq '[.components[]
+            | select((.version // "") == "" or .version == "UNKNOWN")]
+            | length' "${MAVEN_JSON}")
+          if [ "${unresolved}" != "0" ]; then
+            echo "Components with unresolved versions: ${unresolved} ❌"
+            jq -r '.components[]
+              | select((.version // "") == "" or .version == "UNKNOWN")
+              | "  \(.name)"' "${MAVEN_JSON}"
+            errors=1
+          fi
+
+          # The plugin emits the parent/child relationships syft does
+          # not, which is what makes a finding traceable to the direct
+          # dependency that pulled it in
+          if ! jq -e '(.dependencies // []) | length > 0' \
+            "${MAVEN_JSON}" > /dev/null; then
+            echo "SBOM carries no dependency graph ❌"
+            errors=1
+          fi
+
+          # Test scope stays out by default: test dependencies are
+          # absent from the shipped artefact, so a BOM describing that
+          # artefact must not list them
+          if jq -e '[.components[]
+            | select(.name == "junit-jupiter")] | length > 0' \
+            "${MAVEN_JSON}" > /dev/null; then
+            echo "Test-scope dependency present by default ❌"
+            errors=1
+          fi
+          if ! jq -e '[.components[]
+            | select(.name == "junit-jupiter")] | length > 0' \
+            "${DEV_JSON}" > /dev/null; then
+            echo "include_dev did not add test-scope dependencies ❌"
+            errors=1
+          fi
+          if [ "${DEV_COUNT}" -le "${MAVEN_COUNT}" ]; then
+            echo "Test scoping made no difference ❌"
+            echo "Default: ${MAVEN_COUNT}, with test scope: ${DEV_COUNT}"
+            errors=1
+          fi
+
+          # Format placement. 'both' writes both documents to the
+          # output directory; 'xml' must leave the XML there and no
+          # JSON, since a stray JSON would be collected by the
+          # sbom-cyclonedx.* artifact glob the workflows rely on
+          if [ ! -f "${BOTH_JSON}" ] || [ ! -f "${BOTH_XML}" ]; then
+            echo "Both-format run did not emit both documents ❌"
+            errors=1
+          fi
+          if [ -n "${XML_ONLY_JSON}" ]; then
+            echo "XML-only run: unexpected JSON output path ❌"
+            errors=1
+          fi
+          if [ ! -f "${XML_ONLY_XML}" ]; then
+            echo "XML-only run: XML SBOM missing ❌"
+            errors=1
+          fi
+          if [ -n "$(find maven-xml-out -name '*.json' 2>/dev/null)" ]
+          then
+            echo "XML-only run left a JSON document behind ❌"
+            errors=1
+          fi
+
+          # maven_args must not be able to redirect the output
+          # directory away from the validated location
+          if [ "${OVERRIDE_OUTCOME}" = "success" ]; then
+            echo "Protected maven_args override was accepted ❌"
+            errors=1
+          fi
+          if [ -e /tmp/escape ]; then
+            echo "maven_args override escaped the output directory ❌"
+            errors=1
+          fi
+
+          # A spec version the plugin cannot produce must fail rather
+          # than yield a document quietly carrying a different one
+          if [ "${BAD_SPEC_OUTCOME}" = "success" ]; then
+            echo "Unsupported spec version reported success ❌"
+            errors=1
+          fi
+          # ...and must leave nothing behind. The plugin writes a
+          # well-formed BOM before the mismatch is detected, so without
+          # cleanup on rejection the artifact glob would collect and
+          # publish a document this action had already rejected
+          if [ -n "$(find . -maxdepth 1 -name 'sbom-maven-badspec.*' \
+            2>/dev/null)" ]; then
+            echo "Rejected document left in the output directory ❌"
+            find . -maxdepth 1 -name 'sbom-maven-badspec.*'
+            errors=1
+          fi
+
+          if [ "${errors}" != "0" ]; then
+            echo "Maven backend verification failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Maven backend verified: ${MAVEN_COUNT} components ✅"
+          {
+            echo "Maven backend verified ✅"
+            echo "Shipped components: ${MAVEN_COUNT}"
+            echo "With test scope: ${DEV_COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ### Test invalid inputs fail closed ###
   test-failures:
     name: "Test: invalid inputs and error handling"
@@ -314,6 +601,40 @@ jobs:
         with:
           filename_prefix: '../escape'
 
+      # The maven-backend inputs feed a Maven goal coordinate and a
+      # setup-java invocation, so they get validated on every run
+      # rather than only when that backend is selected
+      - name: "Running local action with invalid java version"
+        id: bad-java-version
+        continue-on-error: true
+        uses: ./
+        with:
+          java_version: '21; rm -rf /'
+
+      - name: "Running local action with invalid java distribution"
+        id: bad-java-distribution
+        continue-on-error: true
+        uses: ./
+        with:
+          java_distribution: 'Temurin$(id)'
+
+      - name: "Running local action with invalid plugin version"
+        id: bad-plugin-version
+        continue-on-error: true
+        uses: ./
+        with:
+          maven_plugin_version: 'latest'
+
+      # Syntactically valid but unusable: releases before 2.8.0 do not
+      # bind -DoutputDirectory, so the BOM would land in the project's
+      # target directory instead of the requested location
+      - name: "Running local action with an outdated plugin version"
+        id: old-plugin-version
+        continue-on-error: true
+        uses: ./
+        with:
+          maven_plugin_version: '2.7.5'
+
       # An unsupported CycloneDX spec version passes input validation
       # (digits and dots) but makes the syft scan itself fail,
       # exercising the fail_on_error handling paths
@@ -341,6 +662,11 @@ jobs:
           ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
           OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
           PREFIX_OUTCOME: ${{ steps.bad-prefix.outcome }}
+          JAVA_VERSION_OUTCOME: ${{ steps.bad-java-version.outcome }}
+          # yamllint disable-line rule:line-length
+          JAVA_DISTRIBUTION_OUTCOME: ${{ steps.bad-java-distribution.outcome }}
+          PLUGIN_VERSION_OUTCOME: ${{ steps.bad-plugin-version.outcome }}
+          OLD_PLUGIN_OUTCOME: ${{ steps.old-plugin-version.outcome }}
           HARD_FAIL_OUTCOME: ${{ steps.hard-fail.outcome }}
           SOFT_FAIL_OUTCOME: ${{ steps.soft-fail.outcome }}
           SOFT_FAIL_COUNT: ${{ steps.soft-fail.outputs.component_count }}
@@ -354,6 +680,10 @@ jobs:
             "escape:${ESCAPE_OUTCOME}" \
             "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
             "prefix:${PREFIX_OUTCOME}" \
+            "java-version:${JAVA_VERSION_OUTCOME}" \
+            "java-distribution:${JAVA_DISTRIBUTION_OUTCOME}" \
+            "plugin-version:${PLUGIN_VERSION_OUTCOME}" \
+            "old-plugin:${OLD_PLUGIN_OUTCOME}" \
             "hard-fail:${HARD_FAIL_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
