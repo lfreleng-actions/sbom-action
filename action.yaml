@@ -14,11 +14,21 @@ description: "Generates CycloneDX SBOM reports for projects in any language/ecos
 # single tool. Future backends (cyclonedx-npm, cyclonedx-gomod, an
 # environment-based python backend) can slot in behind the same
 # interface when evidence shows a need for them.
+#
+# The maven backend exists because Java breaks the syft backend's
+# central assumption. Syft reads files, and for Maven the file it reads
+# (pom.xml) is an INPUT TO dependency resolution rather than a product
+# of it: transitive dependencies and BOM-managed versions only exist
+# once Maven has resolved the graph. Go, Node.js and Python all ship
+# resolved manifests (go.mod including indirects, package-lock.json,
+# uv.lock), so they stay on the syft backend. Java is the outlier, and
+# driving Maven's own resolver is the only way to see its real
+# dependency set.
 
 inputs:
   # Optional
   backend:
-    description: "SBOM generation backend; currently supports 'syft'"
+    description: "SBOM generation backend: 'syft' or 'maven'"
     required: false
     default: "syft"
   path_prefix:
@@ -42,7 +52,8 @@ inputs:
     required: false
     default: "."
   include_dev:
-    description: "Include development dependencies in SBOM"
+    # yamllint disable-line rule:line-length
+    description: "Include development dependencies (Maven: test scope) in SBOM"
     required: false
     default: "false"
   fail_on_error:
@@ -52,6 +63,25 @@ inputs:
   syft_version:
     # yamllint disable-line rule:line-length
     description: "Syft version to download (defaults to the installer's pinned version)"
+    required: false
+    default: ""
+
+  # Optional, maven backend only
+  java_version:
+    description: "JDK version for the maven backend"
+    required: false
+    default: "21"
+  java_distribution:
+    description: "JDK distribution for the maven backend"
+    required: false
+    default: "temurin"
+  maven_plugin_version:
+    description: "cyclonedx-maven-plugin version for the maven backend"
+    required: false
+    default: "2.9.3"
+  maven_args:
+    # yamllint disable-line rule:line-length
+    description: "Extra arguments appended to the Maven call, split on whitespace"
     required: false
     default: ""
 
@@ -83,6 +113,9 @@ runs:
         INPUT_FILENAME_PREFIX: ${{ inputs.filename_prefix }}
         INPUT_INCLUDE_DEV: ${{ inputs.include_dev }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        INPUT_JAVA_VERSION: ${{ inputs.java_version }}
+        INPUT_JAVA_DISTRIBUTION: ${{ inputs.java_distribution }}
+        INPUT_MAVEN_PLUGIN_VERSION: ${{ inputs.maven_plugin_version }}
       run: |
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
@@ -95,12 +128,17 @@ runs:
             exit 1
           fi
         done
-        # The action requires GNU realpath -m (missing-path
-        # resolution); BSD/macOS realpath lacks it, and failing here
-        # gives a clearer error than a mid-run failure
+        # The action requires GNU coreutils: realpath -m (missing-path
+        # resolution) and sort -V (version sort). BSD/macOS lacks both,
+        # and failing here gives a clearer error than a mid-run failure
         if ! realpath -m -- / > /dev/null 2>&1; then
           echo "Error: realpath does not support the -m option ❌"
           echo "This action requires GNU coreutils realpath"
+          exit 1
+        fi
+        if ! printf '1\n2\n' | sort -V > /dev/null 2>&1; then
+          echo "Error: sort does not support the -V option ❌"
+          echo "This action requires GNU coreutils sort"
           exit 1
         fi
         # The workspace/temp boundary checks depend on these runner
@@ -115,10 +153,10 @@ runs:
           fi
         done
         case "${INPUT_BACKEND}" in
-          syft) ;;
+          syft|maven) ;;
           *)
             echo "Error: unsupported backend ❌"
-            echo "Supported backends: syft"
+            echo "Supported backends: syft, maven"
             exit 1 ;;
         esac
         case "${INPUT_SBOM_FORMAT}" in
@@ -155,6 +193,48 @@ runs:
             echo "Allowed characters: A-Z a-z 0-9 . _ -"
             exit 1 ;;
         esac
+        # The maven backend interpolates these into a Maven goal
+        # coordinate and a setup-java invocation, so both get the same
+        # whole-string glob treatment as the values above. Validated
+        # unconditionally: a caller that mistypes them while on the
+        # syft backend should still hear about it
+        case "${INPUT_MAVEN_PLUGIN_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid maven_plugin_version ❌"
+            echo "Expected a version such as 2.9.3"
+            exit 1 ;;
+        esac
+        # A syntactically valid version is not necessarily a usable
+        # one. cyclonedx-maven-plugin gained the outputDirectory USER
+        # PROPERTY in 2.8.0; before that the parameter exists but does
+        # not bind from the command line, so -DoutputDirectory is
+        # ignored and the BOM lands in the project's target directory.
+        # The action then reports 'no JSON document produced' and, worse,
+        # has written into the consumer's checkout, breaking the
+        # guarantee that it leaves the tree untouched. Verified with
+        # help:describe against 2.7.5 and 2.8.0.
+        maven_plugin_minimum="2.8.0"
+        oldest="$(printf '%s\n%s\n' "${INPUT_MAVEN_PLUGIN_VERSION}" \
+          "${maven_plugin_minimum}" | sort -V | head -1)"
+        if [ "${oldest}" != "${maven_plugin_minimum}" ]; then
+          echo "Error: maven_plugin_version is too old ❌"
+          echo "Minimum supported: ${maven_plugin_minimum}"
+          echo "Earlier releases ignore -DoutputDirectory, writing the"
+          echo "BOM into the project's target directory instead"
+          exit 1
+        fi
+        case "${INPUT_JAVA_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid java_version ❌"
+            echo "Expected a JDK version such as 17 or 21"
+            exit 1 ;;
+        esac
+        case "${INPUT_JAVA_DISTRIBUTION}" in
+          *[!a-z0-9_-]*|'')
+            echo "Error: invalid java_distribution ❌"
+            echo "Expected a setup-java distribution such as temurin"
+            exit 1 ;;
+        esac
         # Anchor relative paths to GITHUB_WORKSPACE: composite
         # actions can run with a caller-set working directory, so
         # resolving against the current directory would be
@@ -188,15 +268,38 @@ runs:
 
     - name: "Download syft"
       id: syft
+      if: ${{ inputs.backend == 'syft' }}
       # yamllint disable-line rule:line-length
       uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       with:
         syft-version: ${{ inputs.syft_version }}
 
+    # The maven backend resolves the dependency graph with Maven
+    # itself, so it needs a JDK. Maven comes from the runner image.
+    # Guarded so the syft backend keeps its "needs no language
+    # toolchain" property and pays nothing for this step.
+    #
+    # overwrite-settings is disabled because this action wants only the
+    # JDK. Left at its default of true, setup-java rewrites
+    # ~/.m2/settings.xml with its own GitHub server configuration,
+    # which would erase a caller's mirrors, proxies or private
+    # repository credentials immediately before Maven resolves against
+    # them. Where no settings file exists, setup-java still writes its
+    # default, so nothing is lost by declining the overwrite.
+    - name: "Set up JDK"
+      if: ${{ inputs.backend == 'maven' }}
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      with:
+        java-version: ${{ inputs.java_version }}
+        distribution: ${{ inputs.java_distribution }}
+        overwrite-settings: false
+
     - name: "Generate SBOM"
       id: generate
       shell: bash
       env:
+        BACKEND: ${{ inputs.backend }}
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}
         PROJECT_DIR: ${{ inputs.path_prefix }}
         SBOM_FORMAT: ${{ inputs.sbom_format }}
@@ -205,6 +308,13 @@ runs:
         OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
         INCLUDE_DEV: ${{ inputs.include_dev }}
         FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        MAVEN_PLUGIN_VERSION: ${{ inputs.maven_plugin_version }}
+        # NOT named MAVEN_ARGS: Maven 3.9+ reads that name from the
+        # environment and prepends its contents to every invocation.
+        # Since this step also splices the value into the argument
+        # array, the reserved name would apply every caller argument
+        # twice, running a positional goal coordinate twice over.
+        INPUT_MAVEN_ARGS: ${{ inputs.maven_args }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
         # exposes them
@@ -261,6 +371,17 @@ runs:
         json_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.json"
         xml_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.xml"
 
+        # Clear the destinations before generating. The checks after
+        # the backend runs treat a present file as proof that this run
+        # produced it, which only holds if nothing was there already.
+        # A repository can legitimately contain a committed
+        # sbom-cyclonedx.json, and a previous step in the same job can
+        # leave one behind; without this, a backend that exits 0
+        # without writing (the maven plugin does exactly that when a
+        # consumer POM sets cyclonedx.skip) would have the stale
+        # document validated and published as a fresh result.
+        rm -f -- "${json_path}" "${xml_path}"
+
         # Build the syft output arguments. A JSON document always
         # gets generated because the component count derives from it.
         # For xml-only runs the JSON is a transient scratch file under
@@ -275,25 +396,196 @@ runs:
           trap 'rm -rf -- "${scratch_dir}"' EXIT
           json_path="${scratch_dir}/${FILENAME_PREFIX}.json"
         fi
-        set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
-        if [ "${SBOM_FORMAT}" = "xml" ] || \
-          [ "${SBOM_FORMAT}" = "both" ]; then
-          set -- "$@" -o "cyclonedx-xml@${SPEC_VERSION}=${xml_path}"
+
+        case "${BACKEND}" in
+          syft)
+            set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
+            if [ "${SBOM_FORMAT}" = "xml" ] || \
+              [ "${SBOM_FORMAT}" = "both" ]; then
+              set -- "$@" -o "cyclonedx-xml@${SPEC_VERSION}=${xml_path}"
+            fi
+
+            echo "Generating SBOM with syft (dev dependencies:" \
+              "${INCLUDE_DEV})"
+            set +e
+            "${SYFT_CMD}" scan "dir:${PROJECT_DIR}" -q "$@"
+            backend_exit=$?
+            set -e
+            ;;
+          maven)
+            # makeAggregateBom writes every requested format into one
+            # directory and cannot split them, so an xml-only run
+            # generates both into the scratch directory and moves the
+            # XML into place afterwards. Writing JSON into the output
+            # directory instead would leave a document the caller did
+            # not ask for, which the artifact globs would then collect
+            if [ "${SBOM_FORMAT}" = "xml" ]; then
+              gen_dir="${scratch_dir}"
+              output_format="all"
+            elif [ "${SBOM_FORMAT}" = "json" ]; then
+              gen_dir="${OUTPUT_DIR}"
+              output_format="json"
+            else
+              gen_dir="${OUTPUT_DIR}"
+              output_format="all"
+            fi
+            # Direct goal invocation, so the consumer's pom.xml needs
+            # no plugin entry and nothing in the checkout is modified.
+            # makeAggregateBom (not makeBom) runs once at the reactor
+            # root and covers every module, which is what multi-module
+            # projects need.
+            #
+            # includeTestScope maps onto include_dev: Maven's test
+            # scope is the analogue of npm devDependencies, absent
+            # from the shipped artefact and excluded by default. The
+            # plugin's other scope defaults (compile, provided,
+            # runtime, system all true) already mean the BOM
+            # describes what the project ships.
+            #
+            # skipAttach stops the BOM being attached as a build
+            # artifact: this action generates a report, it does not
+            # participate in the project's own build lifecycle.
+            maven_goal="org.cyclonedx:cyclonedx-maven-plugin"
+            maven_goal="${maven_goal}:${MAVEN_PLUGIN_VERSION}"
+            maven_goal="${maven_goal}:makeAggregateBom"
+            set -- "${maven_goal}" -B --no-transfer-progress
+            # Split maven_args on whitespace without running it through
+            # a shell: 'set -f' suppresses pathname expansion for the
+            # duration, so an argument containing * cannot glob against
+            # the runner filesystem, and no eval is involved.
+            #
+            # Caller arguments go BEFORE the action-owned properties
+            # below. Maven resolves a repeated -D to its last
+            # occurrence, so this ordering makes the action's values
+            # authoritative: a caller cannot redirect outputDirectory
+            # outside the validated output directory, nor change the
+            # filename, format, spec version or test scoping that the
+            # outputs, component count and artifact contract depend on.
+            # The explicit rejection below turns a silently ignored
+            # override into a clear error; the ordering is what makes
+            # it safe regardless.
+            if [ -n "${INPUT_MAVEN_ARGS}" ]; then
+              set -f
+              # shellcheck disable=SC2086
+              set -- "$@" ${INPUT_MAVEN_ARGS}
+              set +f
+              for arg in "$@"; do
+                case "${arg}" in
+                  -DoutputFormat|-DoutputFormat=*|\
+                  -DoutputName|-DoutputName=*|\
+                  -DoutputDirectory|-DoutputDirectory=*|\
+                  -DschemaVersion|-DschemaVersion=*|\
+                  -DincludeTestScope|-DincludeTestScope=*|\
+                  -Dcyclonedx.skip|-Dcyclonedx.skip=*|\
+                  -Dcyclonedx.skipAttach|-Dcyclonedx.skipAttach=*)
+                    echo "Error: maven_args overrides a protected" \
+                      "property ❌"
+                    echo "Set these through the action's own inputs:"
+                    echo "  outputFormat     -> sbom_format"
+                    echo "  outputName       -> filename_prefix"
+                    echo "  outputDirectory  -> output_directory"
+                    echo "  schemaVersion    -> sbom_spec_version"
+                    echo "  includeTestScope -> include_dev"
+                    echo "cyclonedx.skip and cyclonedx.skipAttach are" \
+                      "reserved: skipping would defeat the action."
+                    exit 1 ;;
+                esac
+              done
+            fi
+            # Action-owned properties last, so they win.
+            #
+            # skipAttach and skip take the plugin's qualified user
+            # property names. The unqualified forms are the parameter
+            # names, which Maven does NOT bind from the command line:
+            # -DskipAttach=true is silently ignored, leaving the BOM
+            # attached to the project. Verified with help:describe.
+            set -- "$@" \
+              -DoutputFormat="${output_format}" \
+              -DoutputName="${FILENAME_PREFIX}" \
+              -DoutputDirectory="${gen_dir}" \
+              -DschemaVersion="${SPEC_VERSION}" \
+              -DincludeTestScope="${INCLUDE_DEV}" \
+              -Dcyclonedx.skipAttach=true
+
+            echo "Generating SBOM with cyclonedx-maven-plugin" \
+              "${MAVEN_PLUGIN_VERSION} (test scope: ${INCLUDE_DEV})"
+            # Running Maven against the checkout makes the project
+            # EXECUTABLE INPUT, not merely metadata to be read. Maven
+            # loads .mvn/extensions.xml and POM build extensions as
+            # JVM code before this goal runs, and .mvn/maven.config
+            # contributes command-line arguments. None of that can be
+            # disabled from the command line, and it happens even
+            # though the goal itself never compiles anything.
+            #
+            # The maven backend therefore requires a TRUSTED checkout.
+            # This is a genuine difference from the syft backend,
+            # which only reads files, and it is documented in the
+            # README under 'Trust Boundary'.
+            set +e
+            (cd "${PROJECT_DIR}" && mvn "$@")
+            backend_exit=$?
+            set -e
+
+            # Guarded on the file existing: a zero exit does not imply
+            # output was written, and an unguarded mv would abort the
+            # step under 'set -e' before the checks below can route the
+            # failure through fail_on_error
+            if [ "${backend_exit}" = "0" ] && \
+              [ "${SBOM_FORMAT}" = "xml" ] && \
+              [ -f "${scratch_dir}/${FILENAME_PREFIX}.xml" ]; then
+              mv -- "${scratch_dir}/${FILENAME_PREFIX}.xml" "${xml_path}"
+            fi
+            ;;
+        esac
+
+        # Decide the verdict from the artefacts, not the exit code
+        # alone. Both backends can report success without producing a
+        # usable document, and a scan that silently reports nothing is
+        # the failure mode this action exists to avoid.
+        failure_reason=""
+        if [ "${backend_exit}" != "0" ]; then
+          failure_reason="${BACKEND} exited with code ${backend_exit}"
+        fi
+        # The maven backend's plugin honours cyclonedx.skip, which a
+        # consumer POM can set as a property; it then exits 0 having
+        # written nothing at all
+        if [ -z "${failure_reason}" ] && [ ! -f "${json_path}" ]; then
+          failure_reason="no JSON document produced"
+        fi
+        if [ -z "${failure_reason}" ] && \
+          [ "${SBOM_FORMAT}" != "json" ] && [ ! -f "${xml_path}" ]; then
+          failure_reason="no XML document produced"
+        fi
+        # Confirm the document declares the specification version the
+        # caller asked for. cyclonedx-maven-plugin silently falls back
+        # to its own default for a version it does not support rather
+        # than failing, so an unsupported sbom_spec_version would
+        # otherwise yield a success claiming a version the document
+        # does not carry.
+        if [ -z "${failure_reason}" ]; then
+          actual_spec="$(jq -r '.specVersion // ""' "${json_path}")"
+          if [ "${actual_spec}" != "${SPEC_VERSION}" ]; then
+            failure_reason="requested CycloneDX ${SPEC_VERSION} but the"
+            failure_reason="${failure_reason} document declares"
+            failure_reason="${failure_reason} ${actual_spec:-none}"
+          fi
         fi
 
-        echo "Generating SBOM with syft (dev dependencies:" \
-          "${INCLUDE_DEV})"
-        set +e
-        "${SYFT_CMD}" scan "dir:${PROJECT_DIR}" -q "$@"
-        syft_exit=$?
-        set -e
-
-        if [ "${syft_exit}" != "0" ]; then
-          echo "Syft exited with code ${syft_exit}"
+        if [ -n "${failure_reason}" ]; then
+          echo "SBOM generation failed: ${failure_reason}"
+          # Discard anything the backend produced. A rejected document
+          # is still a document: the unsupported-spec-version case
+          # writes a well-formed BOM carrying the wrong version, and a
+          # consumer uploading sbom-cyclonedx.* would publish and scan
+          # it even though this step reported failure. Removing the
+          # destinations keeps the failure contract honest in both
+          # directions - nothing is published, and the reported
+          # component_count of zero matches what is on disk.
+          rm -f -- "${json_path}" "${xml_path}"
           {
             echo "## 📋 SBOM Generation Results"
             echo ""
-            echo "SBOM generation failed (syft exit ${syft_exit}) ❌"
+            echo "SBOM generation failed (${failure_reason}) ❌"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "${FAIL_ON_ERROR}" = "true" ]; then
             echo "::error::SBOM generation failed ❌"
@@ -338,7 +630,7 @@ runs:
         {
           echo "## 📋 SBOM Generation Results"
           echo ""
-          echo "**Backend:** syft"
+          echo "**Backend:** ${BACKEND}"
           echo "**Format:** ${SBOM_FORMAT}"
           echo "**Specification Version:** ${SPEC_VERSION}"
           echo "**Development Dependencies:** ${INCLUDE_DEV}"
