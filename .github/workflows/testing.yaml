@@ -56,7 +56,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
         with:
-          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
+          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -82,7 +82,7 @@ jobs:
 
       - name: "Running local action: ${{ github.repository }}"
         id: sbom
-        uses: ./
+        uses: $/
         with:
           path_prefix: ${{ matrix.path_prefix }}
 
@@ -93,6 +93,8 @@ jobs:
           SBOM_XML_PATH: ${{ steps.sbom.outputs.sbom_xml_path }}
           COMPONENT_COUNT: ${{ steps.sbom.outputs.component_count }}
           BACKEND: ${{ steps.sbom.outputs.backend }}
+          # yamllint disable-line rule:line-length
+          DEPENDENCY_MANAGER: ${{ steps.sbom.outputs.dependency_manager }}
         run: |
           # Verify SBOM outputs
           errors=0
@@ -118,6 +120,12 @@ jobs:
             echo "Unexpected backend output: ${BACKEND} ❌"
             errors=1
           fi
+          # syft is ecosystem-agnostic and drives no build tool, so the
+          # dependency_manager output stays empty rather than guessing
+          if [ -n "${DEPENDENCY_MANAGER}" ]; then
+            echo "syft reported a build tool: ${DEPENDENCY_MANAGER} ❌"
+            errors=1
+          fi
           if [ "${errors}" != "0" ]; then
             echo "SBOM verification failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -140,7 +148,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
         with:
-          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
+          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -166,7 +174,7 @@ jobs:
 
       - name: "Running local action: JSON only, custom placement"
         id: json-only
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           sbom_format: json
@@ -175,14 +183,14 @@ jobs:
 
       - name: "Running local action: XML only"
         id: xml-only
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           sbom_format: xml
 
       - name: "Running local action: development dependencies"
         id: with-dev
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           sbom_format: json
@@ -242,6 +250,299 @@ jobs:
             echo "With development components: ${WITH_DEV_COUNT}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test the cyclonedx backend resolves a real dependency graph ###
+  # The syft backend reads pom.xml as text, which for Maven is an input
+  # to dependency resolution rather than a product of it: transitive
+  # dependencies are invisible and BOM-managed versions come back as
+  # UNKNOWN. This job asserts the cyclonedx backend recovers both.
+  # See lfreleng-actions/java-workflows#47.
+  test-cyclonedx-backend:
+    name: "Test: cyclonedx backend"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+
+      # Block, like every other job here. Running a build tool that
+      # resolves arbitrary plugins under unrestricted egress would make
+      # this self-test an exfiltration surface, so this job is not
+      # dropped to audit.
+      #
+      # No per-job endpoints: the shared allow-list carries Maven
+      # Central and api.adoptium.net, which setup-java queries for
+      # Temurin build metadata.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Multi-module reactor whose core module declares jackson-databind
+      # at compile scope with no version of its own, supplied by an
+      # imported jackson-bom. One declared coordinate, three resolved
+      # components.
+      - name: "Checkout test project: lfreleng-actions/test-maven-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-maven-project
+          # yamllint disable-line rule:line-length
+          ref: bf7b7ec62d40a04cffc8824cf691e6333972fcb1 # v0.1.0
+          path: test-project
+          persist-credentials: false
+
+      - name: "Running local action: cyclonedx backend"
+        id: cyclonedx
+        uses: $/
+        with:
+          backend: cyclonedx
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-maven
+          # This workflow runs on pull requests from a fork, so the
+          # 'auto' default would skip. The override is correct here and
+          # not a workaround: the checkout being scanned is
+          # test-maven-project pinned to an immutable org-owned commit,
+          # not the pull request's own content. The skip path is
+          # covered separately below.
+          untrusted_checkout: 'false'
+
+      - name: "Running local action: cyclonedx backend with test scope"
+        id: cyclonedx-dev
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-maven-dev
+          include_dev: 'true'
+
+      # The plugin cannot split formats across directories, so these two
+      # runs exercise the backend-specific placement logic: 'both'
+      # writes straight to the output directory, while 'xml' generates
+      # both into a scratch directory and moves only the XML across.
+      - name: "Running local action: cyclonedx backend, both formats"
+        id: cyclonedx-both
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: both
+          filename_prefix: sbom-maven-both
+          output_directory: maven-both-out
+
+      - name: "Running local action: cyclonedx backend, XML only"
+        id: cyclonedx-xml
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: xml
+          filename_prefix: sbom-maven-xml
+          output_directory: maven-xml-out
+
+      - name: "Running local action: maven_args override rejected"
+        id: cyclonedx-args-override
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          maven_args: '-DoutputDirectory=/tmp/escape'
+
+      # The plugin does not reject a schema version it cannot produce;
+      # it silently falls back to its own default. Without the
+      # post-generation check this run would report success over a
+      # document carrying a different version than the one requested.
+      - name: "Running local action: unsupported spec version"
+        id: cyclonedx-bad-spec
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-maven-badspec
+          sbom_spec_version: '9.9'
+
+      - name: "Verify the resolved dependency graph"
+        shell: bash
+        env:
+          CDX_JSON: ${{ steps.cyclonedx.outputs.sbom_json_path }}
+          CDX_COUNT: ${{ steps.cyclonedx.outputs.component_count }}
+          CDX_BACKEND: ${{ steps.cyclonedx.outputs.backend }}
+          # yamllint disable-line rule:line-length
+          CDX_MANAGER: ${{ steps.cyclonedx.outputs.dependency_manager }}
+          DEV_JSON: ${{ steps.cyclonedx-dev.outputs.sbom_json_path }}
+          DEV_COUNT: ${{ steps.cyclonedx-dev.outputs.component_count }}
+          BOTH_JSON: ${{ steps.cyclonedx-both.outputs.sbom_json_path }}
+          BOTH_XML: ${{ steps.cyclonedx-both.outputs.sbom_xml_path }}
+          XML_ONLY_JSON: ${{ steps.cyclonedx-xml.outputs.sbom_json_path }}
+          XML_ONLY_XML: ${{ steps.cyclonedx-xml.outputs.sbom_xml_path }}
+          OVERRIDE_OUTCOME: ${{ steps.cyclonedx-args-override.outcome }}
+          BAD_SPEC_OUTCOME: ${{ steps.cyclonedx-bad-spec.outcome }}
+        run: |
+          # Verify the resolved dependency graph
+          errors=0
+          if [ "${CDX_BACKEND}" != "cyclonedx" ]; then
+            echo "Unexpected backend output: ${CDX_BACKEND} ❌"
+            errors=1
+          fi
+          # The backend names the tool, not the build system, so the
+          # build system has to surface separately or the caller cannot
+          # tell which plugin ran
+          if [ "${CDX_MANAGER}" != "maven" ]; then
+            echo "Unexpected dependency_manager: ${CDX_MANAGER} ❌"
+            errors=1
+          fi
+          if [ ! -f "${CDX_JSON}" ]; then
+            echo "CycloneDX SBOM not found: ${CDX_JSON} ❌"
+            exit 1
+          fi
+          if ! jq -e '.bomFormat == "CycloneDX"' \
+            "${CDX_JSON}" > /dev/null; then
+            echo "Generated document is not CycloneDX ❌"
+            errors=1
+          fi
+
+          # Transitive resolution: jackson-core is declared nowhere in
+          # the fixture's POMs and can only appear beneath
+          # jackson-databind, so its presence proves the graph was
+          # resolved rather than parsed
+          for artifact in jackson-databind jackson-core; do
+            if ! jq -e --arg name "${artifact}" \
+              '[.components[] | select(.name == $name)] | length > 0' \
+              "${CDX_JSON}" > /dev/null; then
+              echo "Transitive component missing: ${artifact} ❌"
+              errors=1
+            fi
+          done
+
+          # BOM-managed version resolution: a component without a
+          # usable version cannot be matched against a vulnerability
+          # database, so it is silently unscannable
+          unresolved=$(jq '[.components[]
+            | select((.version // "") == "" or .version == "UNKNOWN")]
+            | length' "${CDX_JSON}")
+          if [ "${unresolved}" != "0" ]; then
+            echo "Components with unresolved versions: ${unresolved} ❌"
+            jq -r '.components[]
+              | select((.version // "") == "" or .version == "UNKNOWN")
+              | "  \(.name)"' "${CDX_JSON}"
+            errors=1
+          fi
+
+          # The plugin emits the parent/child relationships syft does
+          # not, which is what makes a finding traceable to the direct
+          # dependency that pulled it in
+          if ! jq -e '(.dependencies // []) | length > 0' \
+            "${CDX_JSON}" > /dev/null; then
+            echo "SBOM carries no dependency graph ❌"
+            errors=1
+          fi
+
+          # Test scope stays out by default: test dependencies are
+          # absent from the shipped artefact, so a BOM describing that
+          # artefact must not list them
+          if jq -e '[.components[]
+            | select(.name == "junit-jupiter")] | length > 0' \
+            "${CDX_JSON}" > /dev/null; then
+            echo "Test-scope dependency present by default ❌"
+            errors=1
+          fi
+          if ! jq -e '[.components[]
+            | select(.name == "junit-jupiter")] | length > 0' \
+            "${DEV_JSON}" > /dev/null; then
+            echo "include_dev did not add test-scope dependencies ❌"
+            errors=1
+          fi
+          if [ "${DEV_COUNT}" -le "${CDX_COUNT}" ]; then
+            echo "Test scoping made no difference ❌"
+            echo "Default: ${CDX_COUNT}, with test scope: ${DEV_COUNT}"
+            errors=1
+          fi
+
+          # Format placement. 'both' writes both documents to the
+          # output directory; 'xml' must leave the XML there and no
+          # JSON, since a stray JSON would be collected by the
+          # sbom-cyclonedx.* artifact glob the workflows rely on
+          if [ ! -f "${BOTH_JSON}" ] || [ ! -f "${BOTH_XML}" ]; then
+            echo "Both-format run did not emit both documents ❌"
+            errors=1
+          fi
+          if [ -n "${XML_ONLY_JSON}" ]; then
+            echo "XML-only run: unexpected JSON output path ❌"
+            errors=1
+          fi
+          if [ ! -f "${XML_ONLY_XML}" ]; then
+            echo "XML-only run: XML SBOM missing ❌"
+            errors=1
+          fi
+          if [ -n "$(find maven-xml-out -name '*.json' 2>/dev/null)" ]
+          then
+            echo "XML-only run left a JSON document behind ❌"
+            errors=1
+          fi
+
+          # maven_args must not be able to redirect the output
+          # directory away from the validated location
+          if [ "${OVERRIDE_OUTCOME}" = "success" ]; then
+            echo "Protected maven_args override was accepted ❌"
+            errors=1
+          fi
+          if [ -e /tmp/escape ]; then
+            echo "maven_args override escaped the output directory ❌"
+            errors=1
+          fi
+
+          # A spec version the plugin cannot produce must fail rather
+          # than yield a document quietly carrying a different one
+          if [ "${BAD_SPEC_OUTCOME}" = "success" ]; then
+            echo "Unsupported spec version reported success ❌"
+            errors=1
+          fi
+          # ...and must leave nothing behind. The plugin writes a
+          # well-formed BOM before the mismatch is detected, so without
+          # cleanup on rejection the artifact glob would collect and
+          # publish a document this action had already rejected
+          if [ -n "$(find . -maxdepth 1 -name 'sbom-maven-badspec.*' \
+            2>/dev/null)" ]; then
+            echo "Rejected document left in the output directory ❌"
+            find . -maxdepth 1 -name 'sbom-maven-badspec.*'
+            errors=1
+          fi
+
+          if [ "${errors}" != "0" ]; then
+            echo "CycloneDX backend verification failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "CycloneDX backend verified: ${CDX_COUNT} components ✅"
+          {
+            echo "CycloneDX backend verified ✅"
+            echo "Shipped components: ${CDX_COUNT}"
+            echo "With test scope: ${DEV_COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ### Test invalid inputs fail closed ###
   test-failures:
     name: "Test: invalid inputs and error handling"
@@ -256,7 +557,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
         with:
-          config: '@aa81113fe43792f29f939c79ea47a04801cf5342' # v0.4.1
+          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -275,44 +576,397 @@ jobs:
       - name: "Running local action with unsupported backend"
         id: bad-backend
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           backend: cyclonedx-npm
 
       - name: "Running local action with invalid format"
         id: bad-format
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           sbom_format: yaml
 
       - name: "Running local action with missing project directory"
         id: bad-path
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: does/not/exist
 
       - name: "Running local action with workspace-escaping path"
         id: escape-path
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: /etc
 
       - name: "Running local action with escaping output directory"
         id: escape-output
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           output_directory: /opt/escape-test
 
       - name: "Running local action with unsafe filename prefix"
         id: bad-prefix
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           filename_prefix: '../escape'
+
+      # The cyclonedx-backend inputs feed a Maven goal coordinate and
+      # a setup-java invocation, so they get validated on every run
+      # rather than only when that backend is selected
+      - name: "Running local action with invalid java version"
+        id: bad-java-version
+        continue-on-error: true
+        uses: $/
+        with:
+          java_version: '21; rm -rf /'
+
+      - name: "Running local action with invalid java distribution"
+        id: bad-java-distribution
+        continue-on-error: true
+        uses: $/
+        with:
+          java_distribution: 'Temurin$(id)'
+
+      - name: "Running local action with invalid plugin version"
+        id: bad-plugin-version
+        continue-on-error: true
+        uses: $/
+        with:
+          maven_plugin_version: 'latest'
+
+      # Syntactically valid but unusable: releases before 2.8.0 do not
+      # bind -DoutputDirectory, so the BOM would land in the project's
+      # target directory instead of the requested location
+      - name: "Running local action with an outdated plugin version"
+        id: old-plugin-version
+        continue-on-error: true
+        uses: $/
+        with:
+          maven_plugin_version: '2.7.5'
+
+      # The cyclonedx backend names the tool, not the build system, so
+      # it has to detect one. This repository has neither a pom.xml nor
+      # a Gradle build script, so detection must fail rather than
+      # falling through to a Maven invocation that cannot work.
+      # untrusted_checkout is forced off so the run reaches detection:
+      # this workflow runs on a fork pull request, where the default
+      # would skip before getting there.
+      - name: "Running cyclonedx backend with no build tool present"
+        id: no-build-tool
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+
+      # Plant a document at the destination so the assertion below
+      # proves the skip CLEARS it, rather than merely proving the
+      # action wrote nothing. A repository can legitimately commit an
+      # sbom-*.json, and the caller's artifact glob would publish it.
+      # It has to be a STRUCTURALLY valid BOM: the classification
+      # check requires the schema's mandatory bomFormat/specVersion/
+      # version triple before it will replace an existing file.
+      - name: "Plant a stale document at the skip destination"
+        shell: bash
+        run: |
+          # Plant a stale document at the skip destination
+          printf '%s%s\n' \
+            '{"bomFormat":"CycloneDX","specVersion":"1.5",' \
+            '"version":1,"components":[]}' \
+            > sbom-untrusted.json
+
+      # The default must SKIP rather than run, fail, or quietly fall
+      # back to syft. untrusted_checkout is declared explicitly rather
+      # than relying on 'auto': this workflow also runs on pushes to
+      # main and same-repository pull requests, where 'auto' resolves
+      # to trusted and the action would instead fail on this
+      # repository having no Maven or Gradle build. The detection
+      # itself is covered by the validation matrix, not here.
+      - name: "Running cyclonedx backend on an untrusted checkout"
+        id: untrusted-skip
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'true'
+          filename_prefix: sbom-untrusted
+
+      # Coverage for the 'auto' default itself, which the deterministic
+      # cases above deliberately bypass. Each direction is asserted on
+      # the event where its outcome is determinate, and skipped
+      # otherwise, so neither can pass vacuously.
+      - name: "Auto on a fork PR must resolve untrusted"
+        id: auto-fork
+        # yamllint disable-line rule:line-length
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: $/
+        with:
+          backend: cyclonedx
+          filename_prefix: sbom-auto-fork
+
+      - name: "Auto outside a fork PR must resolve trusted"
+        id: auto-trusted
+        # yamllint disable-line rule:line-length
+        if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          filename_prefix: sbom-auto-trusted
+
+      # Maven can exit 0 having written nothing: cyclonedx.skip is a
+      # user property a consumer POM can set. The action must treat
+      # that as a generation failure rather than aborting under set -e
+      # or reporting success over no document.
+      - name: "Create a POM that disables the plugin"
+        shell: bash
+        run: |
+          # Create a POM that disables the plugin
+          mkdir -p skip-pom
+          cat > skip-pom/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.lfreleng.test</groupId>
+            <artifactId>skip-pom</artifactId>
+            <version>1.0.0</version>
+            <packaging>pom</packaging>
+            <properties>
+              <cyclonedx.skip>true</cyclonedx.skip>
+            </properties>
+          </project>
+          POMEOF
+
+      - name: "Plugin disabled by the POM (hard fail)"
+        id: pom-skip-hard
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: skip-pom
+          sbom_format: json
+          filename_prefix: sbom-pomskip-hard
+
+      - name: "Plugin disabled by the POM (soft fail)"
+        id: pom-skip-soft
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: skip-pom
+          sbom_format: json
+          filename_prefix: sbom-pomskip-soft
+          fail_on_error: 'false'
+
+      # The destinations derive from filename_prefix and
+      # output_directory, both caller-controlled and both defaulting
+      # into the workspace. Clearing them must never unlink a project
+      # file: 'pom' would resolve to pom.xml, 'package' to
+      # package.json. A collision with a non-SBOM file has to be
+      # refused rather than removed.
+      # GitHub-hosted runners do not ship xmllint, so without this the
+      # XML collision test would exit at the missing-tool check and
+      # never reach the XPath classifier it exists to cover - passing
+      # for the wrong reason. The archive host is in the shared
+      # allow-list.
+      - name: "Install xmllint for the XML classification test"
+        shell: bash
+        run: |
+          # Install xmllint for the XML classification test
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxml2-utils
+          xmllint --version 2>&1 | head -1
+
+      - name: "Create a file the destination would collide with"
+        shell: bash
+        run: |
+          # Create a file the destination would collide with
+          printf 'not an sbom\n' > collide.json
+          # A bomFormat key alone does not make a file a BOM. This
+          # decoy is package.json-shaped: it declares the key, but its
+          # version is a string where a BOM's is a number, so the
+          # structural check must still refuse it.
+          printf '{"name":"x","version":"1.0.0","bomFormat":"CycloneDX"}\n' \
+            > decoyjson.json
+          # A POM declaring cyclonedx-maven-plugin contains the word
+          # 'cyclonedx'. A substring test would treat it as a BOM and
+          # delete it, so the XML check parses the document element's
+          # namespace and local name instead. Comments carrying the
+          # schema URL and a <bom> must not fool it either.
+          cat > decoy.xml <<'DECOYEOF'
+          <?xml version="1.0"?>
+          <!-- https://cyclonedx.org/schema/bom/1.6 -->
+          <project>
+            <!-- <bom> -->
+            <build><plugins><plugin>
+              <groupId>org.cyclonedx</groupId>
+              <artifactId>cyclonedx-maven-plugin</artifactId>
+            </plugin></plugins></build>
+          </project>
+          DECOYEOF
+          # A broken symlink fails an -e test. Left in place, the
+          # backend would write through it to a path outside the
+          # validated output directory.
+          ln -s /tmp/sbom-action-no-such-target dangling.json
+
+      - name: "Destination collides with a non-SBOM file"
+        id: collide
+        continue-on-error: true
+        uses: $/
+        with:
+          sbom_format: json
+          filename_prefix: collide
+
+      - name: "Destination collides with a POM naming the plugin"
+        id: collide-decoy
+        continue-on-error: true
+        uses: $/
+        with:
+          sbom_format: xml
+          filename_prefix: decoy
+
+      - name: "Destination collides with a bomFormat-only JSON file"
+        id: collide-decoyjson
+        continue-on-error: true
+        uses: $/
+        with:
+          sbom_format: json
+          filename_prefix: decoyjson
+
+      - name: "Destination is a dangling symlink"
+        id: collide-symlink
+        continue-on-error: true
+        uses: $/
+        with:
+          sbom_format: json
+          filename_prefix: dangling
+
+      # The decoys above only prove the classifier REFUSES. This proves
+      # it still accepts: a genuine CycloneDX XML document at the
+      # destination must be replaced, or the guard would block every
+      # legitimate rerun. Needs the xmllint installed above.
+      - name: "Plant a genuine XML BOM at a destination"
+        shell: bash
+        run: |
+          # Plant a genuine XML BOM at a destination
+          mkdir -p replace-xml
+          printf '%s\n%s\n' \
+            '<?xml version="1.0"?>' \
+            '<bom xmlns="http://cyclonedx.org/schema/bom/1.5"/>' \
+            > replace-xml/sbom-cyclonedx.xml
+
+      - name: "Genuine XML BOM at the destination is replaced"
+        id: replace-xml
+        continue-on-error: true
+        uses: $/
+        with:
+          sbom_format: xml
+          output_directory: replace-xml
+
+      # A POM the plugin will actually act on, unlike skip-pom. The
+      # inherited-MAVEN_ARGS test needs a run that SUCCEEDS when the
+      # reserved name is shadowed, so that a leak - which would send
+      # Maven to a non-existent POM - flips the outcome and fails the
+      # assertion. Against skip-pom both cases fail and the test could
+      # not tell them apart.
+      - name: "Create a POM the plugin will act on"
+        shell: bash
+        run: |
+          # Create a POM the plugin will act on
+          mkdir -p live-pom
+          cat > live-pom/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.lfreleng.test</groupId>
+            <artifactId>live-pom</artifactId>
+            <version>1.0.0</version>
+            <packaging>pom</packaging>
+          </project>
+          POMEOF
+
+      # An inherited MAVEN_ARGS reaches Maven without passing through
+      # the input validation, so the action shadows the reserved name.
+      # Set here at step level, which is exactly how a caller's
+      # workflow or job env would leak in.
+      - name: "Inherited MAVEN_ARGS must not reach Maven"
+        id: inherited-maven-args
+        continue-on-error: true
+        env:
+          MAVEN_ARGS: '-f /tmp/elsewhere/pom.xml'
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: live-pom
+          sbom_format: json
+          filename_prefix: sbom-inherited
+
+      - name: "Verify the colliding files survived"
+        shell: bash
+        run: |
+          # Verify the colliding files survived
+          errors=0
+          if [ ! -f collide.json ] || \
+            ! grep -q 'not an sbom' collide.json; then
+            echo "A non-SBOM file at the destination was removed ❌"
+            errors=1
+          fi
+          if [ ! -f decoy.xml ] || \
+            ! grep -q 'cyclonedx-maven-plugin' decoy.xml; then
+            echo "A POM naming the plugin was removed ❌"
+            errors=1
+          fi
+          if [ ! -f decoyjson.json ] || \
+            ! grep -q '"name":"x"' decoyjson.json; then
+            echo "A bomFormat-only JSON file was removed ❌"
+            errors=1
+          fi
+          if [ ! -L dangling.json ]; then
+            echo "A dangling symlink destination was removed ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            exit 1
+          fi
+          echo "Colliding files left intact ✅"
+
+      - name: "Running local action with maven_args override"
+        id: bad-maven-args
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          # Pointed at the skip-pom fixture, not the repository root:
+          # at the root the run would fail on 'no Maven or Gradle
+          # project found' and the outcome assertion would pass
+          # without ever reaching the maven_args normalisation.
+          #
+          # skip=false rather than true so the assertion discriminates.
+          # The fixture POM sets cyclonedx.skip true; if normalisation
+          # regressed and this argument slipped through, it would
+          # override that and generation would SUCCEED, failing the
+          # test. A value of true would merely produce no document,
+          # which already fails for an unrelated reason.
+          path_prefix: skip-pom
+          maven_args: '--define cyclonedx.skip=false'
+
+      - name: "Running local action with an alternate POM"
+        id: bad-maven-file
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: skip-pom
+          maven_args: '-f /tmp/elsewhere/pom.xml'
 
       # An unsupported CycloneDX spec version passes input validation
       # (digits and dots) but makes the syft scan itself fail,
@@ -320,7 +974,7 @@ jobs:
       - name: "Running local action with syft failure (soft fail)"
         id: soft-fail
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           sbom_spec_version: '9.9'
           fail_on_error: false
@@ -328,7 +982,7 @@ jobs:
       - name: "Running local action with syft failure (hard fail)"
         id: hard-fail
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           sbom_spec_version: '9.9'
 
@@ -341,6 +995,35 @@ jobs:
           ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
           OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
           PREFIX_OUTCOME: ${{ steps.bad-prefix.outcome }}
+          JAVA_VERSION_OUTCOME: ${{ steps.bad-java-version.outcome }}
+          # yamllint disable-line rule:line-length
+          JAVA_DISTRIBUTION_OUTCOME: ${{ steps.bad-java-distribution.outcome }}
+          PLUGIN_VERSION_OUTCOME: ${{ steps.bad-plugin-version.outcome }}
+          OLD_PLUGIN_OUTCOME: ${{ steps.old-plugin-version.outcome }}
+          NO_BUILD_TOOL_OUTCOME: ${{ steps.no-build-tool.outcome }}
+          SKIP_OUTCOME: ${{ steps.untrusted-skip.outcome }}
+          SKIP_SKIPPED: ${{ steps.untrusted-skip.outputs.skipped }}
+          SKIP_JSON: ${{ steps.untrusted-skip.outputs.sbom_json_path }}
+          SKIP_COUNT: ${{ steps.untrusted-skip.outputs.component_count }}
+          AUTO_FORK_OUTCOME: ${{ steps.auto-fork.outcome }}
+          AUTO_FORK_SKIPPED: ${{ steps.auto-fork.outputs.skipped }}
+          AUTO_TRUSTED_OUTCOME: ${{ steps.auto-trusted.outcome }}
+          AUTO_TRUSTED_SKIPPED: ${{ steps.auto-trusted.outputs.skipped }}
+          POM_SKIP_HARD_OUTCOME: ${{ steps.pom-skip-hard.outcome }}
+          POM_SKIP_SOFT_OUTCOME: ${{ steps.pom-skip-soft.outcome }}
+          # yamllint disable-line rule:line-length
+          POM_SKIP_SOFT_COUNT: ${{ steps.pom-skip-soft.outputs.component_count }}
+          COLLIDE_OUTCOME: ${{ steps.collide.outcome }}
+          COLLIDE_DECOY_OUTCOME: ${{ steps.collide-decoy.outcome }}
+          # yamllint disable-line rule:line-length
+          COLLIDE_DECOYJSON_OUTCOME: ${{ steps.collide-decoyjson.outcome }}
+          COLLIDE_SYMLINK_OUTCOME: ${{ steps.collide-symlink.outcome }}
+          BAD_MAVEN_ARGS_OUTCOME: ${{ steps.bad-maven-args.outcome }}
+          BAD_MAVEN_FILE_OUTCOME: ${{ steps.bad-maven-file.outcome }}
+          REPLACE_XML_OUTCOME: ${{ steps.replace-xml.outcome }}
+          REPLACE_XML_PATH: ${{ steps.replace-xml.outputs.sbom_xml_path }}
+          # yamllint disable-line rule:line-length
+          INHERITED_ARGS_OUTCOME: ${{ steps.inherited-maven-args.outcome }}
           HARD_FAIL_OUTCOME: ${{ steps.hard-fail.outcome }}
           SOFT_FAIL_OUTCOME: ${{ steps.soft-fail.outcome }}
           SOFT_FAIL_COUNT: ${{ steps.soft-fail.outputs.component_count }}
@@ -354,6 +1037,17 @@ jobs:
             "escape:${ESCAPE_OUTCOME}" \
             "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
             "prefix:${PREFIX_OUTCOME}" \
+            "java-version:${JAVA_VERSION_OUTCOME}" \
+            "java-distribution:${JAVA_DISTRIBUTION_OUTCOME}" \
+            "plugin-version:${PLUGIN_VERSION_OUTCOME}" \
+            "old-plugin:${OLD_PLUGIN_OUTCOME}" \
+            "no-build-tool:${NO_BUILD_TOOL_OUTCOME}" \
+            "collide:${COLLIDE_OUTCOME}" \
+            "collide-decoy:${COLLIDE_DECOY_OUTCOME}" \
+            "collide-decoyjson:${COLLIDE_DECOYJSON_OUTCOME}" \
+            "collide-symlink:${COLLIDE_SYMLINK_OUTCOME}" \
+            "maven-args-define:${BAD_MAVEN_ARGS_OUTCOME}" \
+            "maven-args-file:${BAD_MAVEN_FILE_OUTCOME}" \
             "hard-fail:${HARD_FAIL_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
@@ -372,6 +1066,108 @@ jobs:
             echo "Soft-fail component_count not zero ❌"
             errors=1
           fi
+          # An untrusted checkout must SKIP, not fail and not produce a
+          # document. Failing would red-build a contribution over
+          # something the contributor cannot fix; producing anything
+          # would risk a partial SBOM reading as a clean scan.
+          if [ "${SKIP_OUTCOME}" != "success" ]; then
+            echo "Untrusted checkout failed instead of skipping ❌"
+            errors=1
+          fi
+          if [ "${SKIP_SKIPPED}" != "true" ]; then
+            echo "skipped output was '${SKIP_SKIPPED}', wanted true ❌"
+            errors=1
+          fi
+          # Empty rather than zero: a count of 0 could be misread as a
+          # scan that found nothing
+          if [ -n "${SKIP_JSON}" ] || [ -n "${SKIP_COUNT}" ]; then
+            echo "Skipped run reported results ❌"
+            echo "  json='${SKIP_JSON}' count='${SKIP_COUNT}'"
+            errors=1
+          fi
+          # A committed or previously generated document must not
+          # survive the skip: the caller's artifact glob would publish
+          # it as though this run had produced it
+          if [ -n "$(find . -maxdepth 1 -name 'sbom-untrusted.*' \
+            2>/dev/null)" ]; then
+            echo "Skipped run left a document behind ❌"
+            errors=1
+          fi
+
+          # 'auto' resolution. Each arm runs only on the event where
+          # its outcome is determinate; an arm that did not run reports
+          # outcome 'skipped', which is not a failure. Both assertions
+          # are positive: an action that failed before writing the
+          # output leaves it empty, and an empty value must not satisfy
+          # the check, or a regression turning the safe skip into a
+          # hard failure would pass unnoticed.
+          if [ "${AUTO_FORK_OUTCOME}" != "skipped" ]; then
+            if [ "${AUTO_FORK_OUTCOME}" != "success" ] || \
+              [ "${AUTO_FORK_SKIPPED}" != "true" ]; then
+              echo "auto on a fork PR: wanted success+skipped=true," \
+                "got ${AUTO_FORK_OUTCOME}+'${AUTO_FORK_SKIPPED}' ❌"
+              errors=1
+            fi
+          fi
+          # The trusted arm is expected to FAIL: this repository has no
+          # Maven or Gradle build, so detection rejects it. What must
+          # hold is that validation resolved the checkout as trusted
+          # first, which it records as skipped=false before detecting.
+          if [ "${AUTO_TRUSTED_OUTCOME}" != "skipped" ]; then
+            if [ "${AUTO_TRUSTED_SKIPPED}" != "false" ]; then
+              echo "auto outside a fork PR: wanted skipped=false," \
+                "got '${AUTO_TRUSTED_SKIPPED}' ❌"
+              errors=1
+            fi
+          fi
+
+          # A plugin disabled by the consumer POM exits 0 writing
+          # nothing. That must surface as a generation failure, honour
+          # fail_on_error, and leave no document behind.
+          if [ "${POM_SKIP_HARD_OUTCOME}" = "success" ]; then
+            echo "POM-disabled plugin reported success ❌"
+            errors=1
+          fi
+          if [ "${POM_SKIP_SOFT_OUTCOME}" != "success" ]; then
+            echo "POM-disabled plugin ignored fail_on_error: false ❌"
+            errors=1
+          fi
+          if [ "${POM_SKIP_SOFT_COUNT}" != "0" ]; then
+            echo "Soft-failed run count was" \
+              "'${POM_SKIP_SOFT_COUNT}', wanted 0 ❌"
+            errors=1
+          fi
+          if [ -n "$(find . -maxdepth 1 -name 'sbom-pomskip-*' \
+            2>/dev/null)" ]; then
+            echo "POM-disabled run left a document behind ❌"
+            errors=1
+          fi
+
+          # The classifier must still ACCEPT a real document, or every
+          # legitimate rerun would be blocked by the guard
+          if [ "${REPLACE_XML_OUTCOME}" != "success" ]; then
+            echo "Genuine XML BOM at the destination was not" \
+              "replaced (${REPLACE_XML_OUTCOME}) ❌"
+            errors=1
+          fi
+          if [ -n "${REPLACE_XML_PATH}" ] && \
+            ! grep -q 'cyclonedx.org/schema/bom' \
+            "${REPLACE_XML_PATH}" 2> /dev/null; then
+            echo "Replacement XML is not a CycloneDX document ❌"
+            errors=1
+          fi
+
+          # An inherited MAVEN_ARGS bypasses input validation entirely
+          # unless the action shadows the reserved name. Shadowed, this
+          # run builds live-pom and succeeds; leaked, Maven is sent to
+          # a non-existent POM and the run fails. The outcome is the
+          # discriminator.
+          if [ "${INHERITED_ARGS_OUTCOME}" != "success" ]; then
+            echo "Inherited MAVEN_ARGS reached Maven" \
+              "(${INHERITED_ARGS_OUTCOME}) ❌"
+            errors=1
+          fi
+
           if [ "${errors}" != "0" ]; then
             echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1

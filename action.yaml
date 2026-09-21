@@ -14,11 +14,29 @@ description: "Generates CycloneDX SBOM reports for projects in any language/ecos
 # single tool. Future backends (cyclonedx-npm, cyclonedx-gomod, an
 # environment-based python backend) can slot in behind the same
 # interface when evidence shows a need for them.
+#
+# Backends name the TOOL that produces the document, not the build
+# system it drives. The cyclonedx backend runs the CycloneDX project's
+# own build-tool plugins; today that means cyclonedx-maven-plugin, and
+# cyclonedx-gradle-plugin joins it behind the same backend name. The
+# build tool actually used is reported through the dependency_manager
+# output rather than encoded in the backend name, mirroring how
+# python-sbom-action reports the manager it detected.
+#
+# The cyclonedx backend exists because Java breaks the syft backend's
+# central assumption. Syft reads files, and for Maven the file it reads
+# (pom.xml) is an INPUT TO dependency resolution rather than a product
+# of it: transitive dependencies and BOM-managed versions only exist
+# once Maven has resolved the graph. Go, Node.js and Python all ship
+# resolved manifests (go.mod including indirects, package-lock.json,
+# uv.lock), so they stay on the syft backend. Java is the outlier, and
+# driving the build tool's own resolver is the only way to see its real
+# dependency set.
 
 inputs:
   # Optional
   backend:
-    description: "SBOM generation backend; currently supports 'syft'"
+    description: "SBOM generation backend: 'syft' or 'cyclonedx'"
     required: false
     default: "syft"
   path_prefix:
@@ -42,7 +60,8 @@ inputs:
     required: false
     default: "."
   include_dev:
-    description: "Include development dependencies in SBOM"
+    # yamllint disable-line rule:line-length
+    description: "Include development dependencies (Maven: test scope) in SBOM"
     required: false
     default: "false"
   fail_on_error:
@@ -54,6 +73,31 @@ inputs:
     description: "Syft version to download (defaults to the installer's pinned version)"
     required: false
     default: ""
+
+  # Optional, cyclonedx backend only
+  java_version:
+    description: "JDK version for the cyclonedx backend"
+    required: false
+    default: "21"
+  java_distribution:
+    description: "JDK distribution for the cyclonedx backend"
+    required: false
+    default: "temurin"
+  maven_plugin_version:
+    # yamllint disable-line rule:line-length
+    description: "cyclonedx-maven-plugin version; 2.8.0 or newer"
+    required: false
+    default: "2.9.3"
+  maven_args:
+    # yamllint disable-line rule:line-length
+    description: "Extra arguments appended to the Maven call, split on whitespace"
+    required: false
+    default: ""
+  untrusted_checkout:
+    # yamllint disable-line rule:line-length
+    description: "Is the checkout untrusted: 'auto', 'true' or 'false'"
+    required: false
+    default: "auto"
 
 outputs:
   sbom_json_path:
@@ -68,6 +112,14 @@ outputs:
   backend:
     description: "SBOM generation backend used"
     value: ${{ steps.validate.outputs.backend }}
+  dependency_manager:
+    # yamllint disable-line rule:line-length
+    description: "Build tool the cyclonedx backend drove; empty for syft"
+    value: ${{ steps.validate.outputs.dependency_manager }}
+  skipped:
+    # yamllint disable-line rule:line-length
+    description: "True when generation was skipped; no SBOM exists and counts are empty"
+    value: ${{ steps.validate.outputs.skipped }}
 
 runs:
   using: "composite"
@@ -83,6 +135,15 @@ runs:
         INPUT_FILENAME_PREFIX: ${{ inputs.filename_prefix }}
         INPUT_INCLUDE_DEV: ${{ inputs.include_dev }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        INPUT_JAVA_VERSION: ${{ inputs.java_version }}
+        INPUT_JAVA_DISTRIBUTION: ${{ inputs.java_distribution }}
+        INPUT_MAVEN_PLUGIN_VERSION: ${{ inputs.maven_plugin_version }}
+        INPUT_UNTRUSTED_CHECKOUT: ${{ inputs.untrusted_checkout }}
+        # Empty for every event that is not a pull request. Compared
+        # against GITHUB_REPOSITORY (a default runner variable) to test
+        # whether the head lives outside the base repository.
+        # yamllint disable-line rule:line-length
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       run: |
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
@@ -95,12 +156,17 @@ runs:
             exit 1
           fi
         done
-        # The action requires GNU realpath -m (missing-path
-        # resolution); BSD/macOS realpath lacks it, and failing here
-        # gives a clearer error than a mid-run failure
+        # The action requires GNU coreutils: realpath -m (missing-path
+        # resolution) and sort -V (version sort). BSD/macOS lacks both,
+        # and failing here gives a clearer error than a mid-run failure
         if ! realpath -m -- / > /dev/null 2>&1; then
           echo "Error: realpath does not support the -m option ❌"
           echo "This action requires GNU coreutils realpath"
+          exit 1
+        fi
+        if ! printf '1\n2\n' | sort -V > /dev/null 2>&1; then
+          echo "Error: sort does not support the -V option ❌"
+          echo "This action requires GNU coreutils sort"
           exit 1
         fi
         # The workspace/temp boundary checks depend on these runner
@@ -115,10 +181,10 @@ runs:
           fi
         done
         case "${INPUT_BACKEND}" in
-          syft) ;;
+          syft|cyclonedx) ;;
           *)
             echo "Error: unsupported backend ❌"
-            echo "Supported backends: syft"
+            echo "Supported backends: syft, cyclonedx"
             exit 1 ;;
         esac
         case "${INPUT_SBOM_FORMAT}" in
@@ -139,6 +205,13 @@ runs:
             echo "Error: fail_on_error must be 'true' or 'false' ❌"
             exit 1 ;;
         esac
+        case "${INPUT_UNTRUSTED_CHECKOUT}" in
+          auto|true|false) ;;
+          *)
+            echo "Error: untrusted_checkout must be 'auto', 'true'" \
+              "or 'false' ❌"
+            exit 1 ;;
+        esac
         # A case glob validates the entire string, including embedded
         # newlines; grep would only validate per line
         case "${INPUT_SBOM_SPEC_VERSION}" in
@@ -153,6 +226,48 @@ runs:
           *[!A-Za-z0-9._-]*|'')
             echo "Error: invalid filename_prefix ❌"
             echo "Allowed characters: A-Z a-z 0-9 . _ -"
+            exit 1 ;;
+        esac
+        # The cyclonedx backend interpolates these into a Maven goal
+        # coordinate and a setup-java invocation, so both get the same
+        # whole-string glob treatment as the values above. Validated
+        # unconditionally: a caller that mistypes them while on the
+        # syft backend should still hear about it
+        case "${INPUT_MAVEN_PLUGIN_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid maven_plugin_version ❌"
+            echo "Expected a version such as 2.9.3"
+            exit 1 ;;
+        esac
+        # A syntactically valid version is not necessarily a usable
+        # one. cyclonedx-maven-plugin gained the outputDirectory USER
+        # PROPERTY in 2.8.0; before that the parameter exists but does
+        # not bind from the command line, so -DoutputDirectory is
+        # ignored and the BOM lands in the project's target directory.
+        # The action then reports 'no JSON document produced' and, worse,
+        # has written into the consumer's checkout, breaking the
+        # guarantee that it leaves the tree untouched. Verified with
+        # help:describe against 2.7.5 and 2.8.0.
+        maven_plugin_minimum="2.8.0"
+        oldest="$(printf '%s\n%s\n' "${INPUT_MAVEN_PLUGIN_VERSION}" \
+          "${maven_plugin_minimum}" | sort -V | head -1)"
+        if [ "${oldest}" != "${maven_plugin_minimum}" ]; then
+          echo "Error: maven_plugin_version is too old ❌"
+          echo "Minimum supported: ${maven_plugin_minimum}"
+          echo "Earlier releases ignore -DoutputDirectory, writing the"
+          echo "BOM into the project's target directory instead"
+          exit 1
+        fi
+        case "${INPUT_JAVA_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid java_version ❌"
+            echo "Expected a JDK version such as 17 or 21"
+            exit 1 ;;
+        esac
+        case "${INPUT_JAVA_DISTRIBUTION}" in
+          *[!a-z0-9_-]*|'')
+            echo "Error: invalid java_distribution ❌"
+            echo "Expected a setup-java distribution such as temurin"
             exit 1 ;;
         esac
         # Anchor relative paths to GITHUB_WORKSPACE: composite
@@ -186,17 +301,150 @@ runs:
         esac
         echo "backend=${INPUT_BACKEND}" >> "$GITHUB_OUTPUT"
 
+        # Decide whether the checkout can be trusted to execute.
+        #
+        # The cyclonedx backend runs the project's own build tool,
+        # which loads .mvn/extensions.xml, POM build extensions and
+        # .mvn/maven.config from the CHECKOUT as code. No flag
+        # disables that, so the only control available is whether to
+        # run the backend at all.
+        #
+        # 'auto' detects the case this action can see for itself: a
+        # pull request whose head lives outside the base repository.
+        # It cannot see every case - a Gerrit refspec checkout carries
+        # unreviewed contributor code with no pull request context at
+        # all, and reads as trusted here - so a caller that knows
+        # better passes 'true' explicitly. Callers that have already
+        # gathered context (repository-metadata-action exposes
+        # is_fork) can wire it straight in.
+        untrusted="${INPUT_UNTRUSTED_CHECKOUT}"
+        if [ "${untrusted}" = "auto" ]; then
+          untrusted="false"
+          case "${GITHUB_EVENT_NAME:-}" in
+            merge_group)
+              # A merge queue builds a speculative merge of the queued
+              # pull requests. Those may have originated in forks, and
+              # the event carries no head repository to compare
+              # against, so provenance cannot be established for the
+              # tree as a whole - one fork-originated entry taints it.
+              untrusted="true" ;;
+            pull_request|pull_request_target)
+              # Cross-repository is the test, not "unmerged". A
+              # same-repository branch was pushed by someone with
+              # write access, who could equally push to the default
+              # branch; treating their pull request as untrusted would
+              # disable this backend for the pull request scanning it
+              # exists to serve, without raising the bar they already
+              # clear. Callers whose threat model includes
+              # write-access contributors can set untrusted_checkout
+              # to true.
+              #
+              # Fail closed on a pull request event: an empty
+              # PR_HEAD_REPO means the head repository could not be
+              # read - a deleted fork, for instance - which is exactly
+              # where trust cannot be established.
+              if [ -z "${PR_HEAD_REPO}" ] || \
+                [ "${PR_HEAD_REPO}" != "${GITHUB_REPOSITORY:-}" ]; then
+                untrusted="true"
+              fi ;;
+          esac
+        fi
+
+        # Skip rather than fail, and skip rather than fall back to
+        # syft. Falling back would emit a document missing the
+        # transitive graph and carrying UNKNOWN versions, which reads
+        # as a clean scan; no SBOM at all is honest, a misleading one
+        # is worse than nothing. Skipping (not failing) keeps an
+        # untrusted contribution from turning into a red build for
+        # something the contributor cannot fix.
+        #
+        # Only the decision is taken here. Generate SBOM still runs and
+        # acts on it, because the destination files have to be cleared
+        # whether or not generation happens - otherwise a checked-in or
+        # previously generated sbom-cyclonedx.* would survive the skip
+        # and be published by the caller's artifact glob.
+        skipped="false"
+        if [ "${INPUT_BACKEND}" = "cyclonedx" ] && \
+          [ "${untrusted}" = "true" ]; then
+          skipped="true"
+        fi
+        echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+
+        # Resolve which build tool the cyclonedx backend will drive.
+        # The backend names the tool producing the document, not the
+        # build system, so the build system is detected here and
+        # reported through the dependency_manager output - the caller
+        # would otherwise have no way to tell which plugin ran.
+        # Detecting before the JDK download also means an unsupported
+        # project fails fast rather than after a toolchain install.
+        dependency_manager=""
+        if [ "${INPUT_BACKEND}" = "cyclonedx" ] && \
+          [ "${skipped}" != "true" ]; then
+          if [ -f "${resolved}/pom.xml" ]; then
+            dependency_manager="maven"
+          elif [ -f "${resolved}/build.gradle" ] || \
+            [ -f "${resolved}/build.gradle.kts" ] || \
+            [ -f "${resolved}/settings.gradle" ] || \
+            [ -f "${resolved}/settings.gradle.kts" ]; then
+            echo "Error: Gradle is not yet supported ❌"
+            echo "The cyclonedx backend currently drives Maven only;"
+            echo "Gradle support is tracked upstream. Use the syft"
+            echo "backend for Gradle projects in the meantime."
+            exit 1
+          else
+            echo "Error: no Maven or Gradle project found ❌"
+            echo "The cyclonedx backend needs a pom.xml or a Gradle"
+            echo "build script in the project directory"
+            exit 1
+          fi
+          echo "Detected build tool: ${dependency_manager}"
+        fi
+        echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
+
     - name: "Download syft"
       id: syft
+      # yamllint disable-line rule:line-length
+      if: ${{ inputs.backend == 'syft' && steps.validate.outputs.skipped != 'true' }}
       # yamllint disable-line rule:line-length
       uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       with:
         syft-version: ${{ inputs.syft_version }}
 
+    # The cyclonedx backend resolves the dependency graph with the
+    # project's own build tool, so it needs a JDK. Maven comes from the
+    # runner image. Guarded so the syft backend keeps its "needs no
+    # language toolchain" property and pays nothing for this step.
+    #
+    # overwrite-settings is disabled because this action wants only the
+    # JDK. Left at its default of true, setup-java rewrites
+    # ~/.m2/settings.xml with its own GitHub server configuration,
+    # which would erase a caller's mirrors, proxies or private
+    # repository credentials immediately before Maven resolves against
+    # them. Where no settings file exists, setup-java still writes its
+    # default, so nothing is lost by declining the overwrite.
+    - name: "Set up JDK"
+      # yamllint disable-line rule:line-length
+      if: ${{ inputs.backend == 'cyclonedx' && steps.validate.outputs.skipped != 'true' }}
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      with:
+        java-version: ${{ inputs.java_version }}
+        distribution: ${{ inputs.java_distribution }}
+        overwrite-settings: false
+
     - name: "Generate SBOM"
       id: generate
+      # Runs even for a skipped backend: the destination files must be
+      # cleared either way, so that a skip cannot leave a stale
+      # document behind for the caller's artifact glob to publish. A
+      # skipped run emits no paths and no component count, so the
+      # outputs stay empty rather than reporting zero and no caller can
+      # read a skip as a clean scan.
       shell: bash
       env:
+        BACKEND: ${{ inputs.backend }}
+        DEPENDENCY_MANAGER: ${{ steps.validate.outputs.dependency_manager }}
+        SKIPPED: ${{ steps.validate.outputs.skipped }}
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}
         PROJECT_DIR: ${{ inputs.path_prefix }}
         SBOM_FORMAT: ${{ inputs.sbom_format }}
@@ -205,6 +453,21 @@ runs:
         OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
         INCLUDE_DEV: ${{ inputs.include_dev }}
         FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        MAVEN_PLUGIN_VERSION: ${{ inputs.maven_plugin_version }}
+        # Shadowed, not merely avoided. Maven 3.9+ reads MAVEN_ARGS
+        # from the environment and prepends it to every invocation, so
+        # a value set at the caller's workflow or job level would
+        # reach Maven without passing any of the validation below -
+        # including the alternate-project rejection. Naming the input
+        # INPUT_MAVEN_ARGS avoids the collision; setting the reserved
+        # name empty here closes the inherited route.
+        MAVEN_ARGS: ""
+        # NOT named MAVEN_ARGS: Maven 3.9+ reads that name from the
+        # environment and prepends its contents to every invocation.
+        # Since this step also splices the value into the argument
+        # array, the reserved name would apply every caller argument
+        # twice, running a positional goal coordinate twice over.
+        INPUT_MAVEN_ARGS: ${{ inputs.maven_args }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
         # exposes them
@@ -261,6 +524,147 @@ runs:
         json_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.json"
         xml_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.xml"
 
+        # Clear the destinations before generating. The checks after
+        # the backend runs treat a present file as proof that this run
+        # produced it, which only holds if nothing was there already.
+        # A repository can legitimately contain a committed
+        # sbom-cyclonedx.json, and a previous step in the same job can
+        # leave one behind; without this, a backend that exits 0
+        # without writing (cyclonedx-maven-plugin does exactly that
+        # when a consumer POM sets cyclonedx.skip) would have the stale
+        # document validated and published as a fresh result.
+        #
+        # Removal is guarded on the file actually being a CycloneDX
+        # document. The destinations derive from filename_prefix and
+        # output_directory, both caller-controlled and both defaulting
+        # into the workspace, so an unguarded rm would delete project
+        # files: filename_prefix 'pom' resolves to pom.xml, 'package'
+        # to package.json. Refusing is the only safe answer - the file
+        # can be neither removed nor left in place without breaking a
+        # promise - and it is a configuration error the caller can fix.
+        purge_destination() {
+          target="$1"
+          kind="$2"
+          # Tested before -e, which follows links: a BROKEN symlink
+          # fails -e, so returning early on one would leave it in
+          # place for the backend to write through, landing the
+          # document outside the validated output directory and
+          # possibly over an unrelated runner file. A symlink at a
+          # destination this action owns is never legitimate.
+          if [ -L "${target}" ]; then
+            echo "Error: refusing to write through a symlink ❌"
+            printf 'Path: %s\n' \
+              "$(printf '%s' "${target}" | tr -d '\r\n')"
+            echo "Remove it, or choose a different filename_prefix or"
+            echo "output_directory."
+            exit 1
+          fi
+          [ -e "${target}" ] || return 0
+          looks_like_bom="no"
+          case "${kind}" in
+            json)
+              # The mandatory triple from the CycloneDX JSON schema,
+              # not bomFormat alone: any file can carry that one key,
+              # and filename_prefix can aim these destinations at
+              # project files. A package.json declaring a bomFormat
+              # still fails here, because its version is a string
+              # where a BOM's is a number.
+              if jq -e 'type == "object"
+                and .bomFormat == "CycloneDX"
+                and (.specVersion | type == "string")
+                and (.version | type == "number")' "${target}" \
+                > /dev/null 2>&1; then
+                looks_like_bom="yes"
+              fi ;;
+            xml)
+              # Parsed, not grepped. A substring search matches text
+              # inside comments, so an XML file carrying the schema
+              # URL and a <bom> in comments would be classified as a
+              # BOM and unlinked - and filename_prefix can point these
+              # destinations at project files. Only the document
+              # element's namespace and local name decide it.
+              #
+              # Reported distinctly when xmllint is absent. Falling
+              # through to the generic collision error would claim a
+              # valid BOM is not one, which is what a second XML run
+              # on a runner without libxml2-utils would hit: the first
+              # run writes the document, the next cannot classify it.
+              if ! command -v xmllint > /dev/null 2>&1; then
+                echo "Error: cannot classify the XML destination ❌"
+                printf 'Path: %s\n' \
+                  "$(printf '%s' "${target}" | tr -d '\r\n')"
+                echo "A file already exists there, and xmllint"
+                echo "(libxml2-utils) is needed to tell a CycloneDX"
+                echo "document from any other XML. Install it, remove"
+                echo "the file, or pick another filename_prefix or"
+                echo "output_directory."
+                exit 1
+              fi
+              xml_root="$(xmllint --xpath \
+                'concat(namespace-uri(/*)," ",local-name(/*))' \
+                "${target}" 2> /dev/null || true)"
+              case "${xml_root}" in
+                'http://cyclonedx.org/schema/bom/'*' bom')
+                  looks_like_bom="yes" ;;
+              esac ;;
+          esac
+          if [ "${looks_like_bom}" != "yes" ]; then
+            echo "Error: refusing to overwrite a non-SBOM file ❌"
+            printf 'Path: %s\n' \
+              "$(printf '%s' "${target}" | tr -d '\r\n')"
+            echo "This path comes from filename_prefix and"
+            echo "output_directory. Choose values that do not collide"
+            echo "with files in the project."
+            exit 1
+          fi
+          rm -f -- "${target}"
+        }
+        # Both destinations, regardless of the requested format. The
+        # action owns ${FILENAME_PREFIX}.json and
+        # ${FILENAME_PREFIX}.xml under output_directory: they derive
+        # entirely from its own inputs. Clearing only the requested
+        # format leaves the sibling behind, and the artifact glob this
+        # README documents (sbom-cyclonedx.*) would then publish a
+        # stale document from an earlier run as though this one had
+        # produced it - including on a skip, where the guarantee is
+        # that nothing is published at all. Removal stays guarded, so
+        # a file that is not a CycloneDX document is refused rather
+        # than deleted.
+        #
+        # A caller accumulating formats across separate runs must give
+        # each run its own filename_prefix or output_directory.
+        purge_destination "${json_path}" json
+        purge_destination "${xml_path}" xml
+
+        # Act on the trust decision taken during validation. Placed
+        # after the clearing above so the "no document" claim is true
+        # of the workspace, not merely of this run: a committed
+        # sbom-cyclonedx.json would otherwise survive the skip and be
+        # published by the caller's artifact glob.
+        if [ "${SKIPPED}" = "true" ]; then
+          echo "::warning::SBOM generation skipped: the ${BACKEND}" \
+            "backend executes code from the checkout, which is not" \
+            "trusted here"
+          {
+            echo "## 📋 SBOM Generation Results"
+            echo ""
+            echo "SBOM generation skipped ⏭️"
+            echo ""
+            echo "The \`${BACKEND}\` backend runs the project's build"
+            echo "tool, which loads build configuration from the"
+            echo "checkout as code. This checkout is untrusted, so no"
+            echo "SBOM was produced."
+            echo ""
+            echo "No document was written and no counts are reported:"
+            echo "a partial or lower-fidelity SBOM would read as a"
+            echo "clean result."
+            echo ""
+            echo "Set \`untrusted_checkout: 'false'\` where the"
+            echo "checkout is known to be trusted."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
         # Build the syft output arguments. A JSON document always
         # gets generated because the component count derives from it.
         # For xml-only runs the JSON is a transient scratch file under
@@ -275,25 +679,277 @@ runs:
           trap 'rm -rf -- "${scratch_dir}"' EXIT
           json_path="${scratch_dir}/${FILENAME_PREFIX}.json"
         fi
-        set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
-        if [ "${SBOM_FORMAT}" = "xml" ] || \
-          [ "${SBOM_FORMAT}" = "both" ]; then
-          set -- "$@" -o "cyclonedx-xml@${SPEC_VERSION}=${xml_path}"
+
+        case "${BACKEND}" in
+          syft)
+            set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
+            if [ "${SBOM_FORMAT}" = "xml" ] || \
+              [ "${SBOM_FORMAT}" = "both" ]; then
+              set -- "$@" -o "cyclonedx-xml@${SPEC_VERSION}=${xml_path}"
+            fi
+
+            echo "Generating SBOM with syft (dev dependencies:" \
+              "${INCLUDE_DEV})"
+            set +e
+            "${SYFT_CMD}" scan "dir:${PROJECT_DIR}" -q "$@"
+            backend_exit=$?
+            set -e
+            ;;
+          cyclonedx)
+            # Only maven reaches here: validate rejects Gradle and
+            # anything unrecognised, so DEPENDENCY_MANAGER is 'maven'.
+            # A Gradle branch joins this case rather than becoming a
+            # separate backend.
+            # makeAggregateBom writes every requested format into one
+            # directory and cannot split them, so an xml-only run
+            # generates both into the scratch directory and moves the
+            # XML into place afterwards. Writing JSON into the output
+            # directory instead would leave a document the caller did
+            # not ask for, which the artifact globs would then collect
+            if [ "${SBOM_FORMAT}" = "xml" ]; then
+              gen_dir="${scratch_dir}"
+              output_format="all"
+            elif [ "${SBOM_FORMAT}" = "json" ]; then
+              gen_dir="${OUTPUT_DIR}"
+              output_format="json"
+            else
+              gen_dir="${OUTPUT_DIR}"
+              output_format="all"
+            fi
+            # Direct goal invocation, so the consumer's pom.xml needs
+            # no plugin entry and the build leaves no target/
+            # directories behind. The action does write its report
+            # files, which land in the checkout whenever
+            # output_directory points there; what stays untouched is
+            # the project itself.
+            # makeAggregateBom (not makeBom) runs once at the reactor
+            # root and covers every module, which is what multi-module
+            # projects need.
+            #
+            # includeTestScope maps onto include_dev: Maven's test
+            # scope is the analogue of npm devDependencies, absent
+            # from every deployment and excluded by default. The
+            # plugin's other scope defaults (compile, runtime,
+            # provided, system all true) are left alone, so the BOM
+            # describes what the application depends on at RUNTIME
+            # rather than only what the build packages. provided and
+            # system artefacts are absent from the JAR yet present
+            # when the application runs, so a vulnerability in one is
+            # real; neither property is reserved, and a caller wanting
+            # a packaging-only BOM can disable them via maven_args.
+            #
+            # skipAttach stops the BOM being attached as a build
+            # artifact: this action generates a report, it does not
+            # participate in the project's own build lifecycle.
+            maven_goal="org.cyclonedx:cyclonedx-maven-plugin"
+            maven_goal="${maven_goal}:${MAVEN_PLUGIN_VERSION}"
+            maven_goal="${maven_goal}:makeAggregateBom"
+            set -- "${maven_goal}" -B --no-transfer-progress
+            # Split maven_args on whitespace without running it through
+            # a shell: 'set -f' suppresses pathname expansion for the
+            # duration, so an argument containing * cannot glob against
+            # the runner filesystem, and no eval is involved.
+            #
+            # Caller arguments go BEFORE the action-owned properties
+            # below. Maven resolves a repeated -D to its last
+            # occurrence, so this ordering makes the action's values
+            # authoritative: a caller cannot redirect outputDirectory
+            # outside the validated output directory, nor change the
+            # filename, format, spec version or test scoping that the
+            # outputs, component count and artifact contract depend on.
+            # The explicit rejection below turns a silently ignored
+            # override into a clear error; the ordering is what makes
+            # it safe regardless.
+            if [ -n "${INPUT_MAVEN_ARGS}" ]; then
+              set -f
+              # shellcheck disable=SC2086
+              set -- "$@" ${INPUT_MAVEN_ARGS}
+              set +f
+              # Maven spells a system property four ways: -Dname,
+              # -D name, --define name and --define=name. Matching
+              # only the compact -D form let '--define cyclonedx.skip'
+              # through, so each argument is normalised to a bare
+              # name=value before the name is compared.
+              expect_value="no"
+              for arg in "$@"; do
+                candidate=""
+                if [ "${expect_value}" = "yes" ]; then
+                  candidate="${arg}"
+                  expect_value="no"
+                else
+                  case "${arg}" in
+                    -D|--define)
+                      expect_value="yes"
+                      continue ;;
+                    --define=*) candidate="${arg#--define=}" ;;
+                    -D*) candidate="${arg#-D}" ;;
+                    # Maven's -f/--file selects an alternate POM or
+                    # project directory, which would resolve and
+                    # execute a project outside the PROJECT_DIR this
+                    # action validated against the workspace, and
+                    # describe it in an SBOM labelled with
+                    # path_prefix. Rejected in every spelling; use
+                    # path_prefix to choose the project.
+                    -f|-f=*|-f?*|--file|--file=*)
+                      echo "Error: maven_args may not select an" \
+                        "alternate project ❌"
+                      echo "-f/--file would escape the validated"
+                      echo "project directory. Use path_prefix to"
+                      echo "choose which project to scan."
+                      exit 1 ;;
+                  esac
+                fi
+                [ -n "${candidate}" ] || continue
+                case "${candidate%%=*}" in
+                  outputFormat|outputName|outputDirectory|\
+                  schemaVersion|includeTestScope|\
+                  cyclonedx.skip|cyclonedx.skipAttach)
+                    echo "Error: maven_args overrides a protected" \
+                      "property ❌"
+                    echo "Set these through the action's own inputs:"
+                    echo "  outputFormat     -> sbom_format"
+                    echo "  outputName       -> filename_prefix"
+                    echo "  outputDirectory  -> output_directory"
+                    echo "  schemaVersion    -> sbom_spec_version"
+                    echo "  includeTestScope -> include_dev"
+                    echo "cyclonedx.skip and cyclonedx.skipAttach are" \
+                      "reserved: skipping would defeat the action."
+                    exit 1 ;;
+                esac
+              done
+            fi
+            # Action-owned properties last, so they win.
+            #
+            # skipAttach and skip take the plugin's qualified user
+            # property names. The unqualified forms are the parameter
+            # names, which Maven does NOT bind from the command line:
+            # -DskipAttach=true is silently ignored, leaving the BOM
+            # attached to the project. Verified with help:describe.
+            set -- "$@" \
+              -DoutputFormat="${output_format}" \
+              -DoutputName="${FILENAME_PREFIX}" \
+              -DoutputDirectory="${gen_dir}" \
+              -DschemaVersion="${SPEC_VERSION}" \
+              -DincludeTestScope="${INCLUDE_DEV}" \
+              -Dcyclonedx.skipAttach=true
+
+            echo "Generating SBOM with cyclonedx-maven-plugin" \
+              "${MAVEN_PLUGIN_VERSION} (test scope: ${INCLUDE_DEV})"
+            # Running the build tool against the checkout makes the
+            # project EXECUTABLE INPUT, not merely metadata to be read.
+            # Maven loads .mvn/extensions.xml and POM build extensions
+            # as JVM code before this goal runs, and .mvn/maven.config
+            # contributes command-line arguments. None of that can be
+            # disabled from the command line, and it happens even
+            # though the goal itself never compiles anything.
+            #
+            # The cyclonedx backend therefore requires a TRUSTED
+            # checkout. This is a genuine difference from the syft
+            # backend, which only reads files, and it is documented in
+            # the README under 'Trust Boundary'.
+            set +e
+            (cd "${PROJECT_DIR}" && mvn "$@")
+            backend_exit=$?
+            set -e
+
+            # Guarded on the file existing: a zero exit does not imply
+            # output was written, and an unguarded mv would abort the
+            # step under 'set -e' before the checks below can route the
+            # failure through fail_on_error
+            if [ "${backend_exit}" = "0" ] && \
+              [ "${SBOM_FORMAT}" = "xml" ] && \
+              [ -f "${scratch_dir}/${FILENAME_PREFIX}.xml" ]; then
+              mv -- "${scratch_dir}/${FILENAME_PREFIX}.xml" "${xml_path}"
+            fi
+            ;;
+        esac
+
+        # Decide the verdict from the artefacts, not the exit code
+        # alone. Both backends can report success without producing a
+        # usable document, and a scan that silently reports nothing is
+        # the failure mode this action exists to avoid.
+        failure_reason=""
+        if [ "${backend_exit}" != "0" ]; then
+          failure_reason="${BACKEND} exited with code ${backend_exit}"
+        fi
+        # The cyclonedx backend's plugin honours cyclonedx.skip, which a
+        # consumer POM can set as a property; it then exits 0 having
+        # written nothing at all
+        if [ -z "${failure_reason}" ] && [ ! -f "${json_path}" ]; then
+          failure_reason="no JSON document produced"
+        fi
+        if [ -z "${failure_reason}" ] && \
+          [ "${SBOM_FORMAT}" != "json" ] && [ ! -f "${xml_path}" ]; then
+          failure_reason="no XML document produced"
+        fi
+        # Confirm the document declares the specification version the
+        # caller asked for. cyclonedx-maven-plugin silently falls back
+        # to its own default for a version it does not support rather
+        # than failing, so an unsupported sbom_spec_version would
+        # otherwise yield a success claiming a version the document
+        # does not carry.
+        if [ -z "${failure_reason}" ]; then
+          # Assigned inside the condition so a parse failure lands in
+          # failure_reason rather than aborting the step: a bare
+          # command substitution would exit nonzero under 'set -e',
+          # bypassing fail_on_error and leaving the rejected document
+          # on disk for the artifact glob to collect.
+          if ! actual_spec="$(jq -r '.specVersion // ""' \
+            "${json_path}" 2> /dev/null)"; then
+            failure_reason="the generated JSON document is malformed"
+          elif [ "${actual_spec}" != "${SPEC_VERSION}" ]; then
+            failure_reason="requested CycloneDX ${SPEC_VERSION} but the"
+            failure_reason="${failure_reason} document declares"
+            failure_reason="${failure_reason} ${actual_spec:-none}"
+          fi
         fi
 
-        echo "Generating SBOM with syft (dev dependencies:" \
-          "${INCLUDE_DEV})"
-        set +e
-        "${SYFT_CMD}" scan "dir:${PROJECT_DIR}" -q "$@"
-        syft_exit=$?
-        set -e
+        # Read here rather than after the handler below. A document
+        # can be valid JSON, carry the right specVersion, and still
+        # have a components value jq cannot measure - {"components":
+        # true} parses, passes the version gate, and errors on length.
+        # Computing it inside the verification block routes that
+        # through fail_on_error instead of yielding a clean result
+        # reporting zero components.
+        if [ -z "${failure_reason}" ]; then
+          # 'length' alone does not establish an array: jq returns a
+          # key count for an object and a character count for a
+          # string, so {"components":{"x":1}} and
+          # {"components":"abc"} would publish counts of 1 and 3. The
+          # type is asserted explicitly, with a missing components key
+          # still meaning zero.
+          if ! component_count="$(jq '
+            if (.components == null) then 0
+            elif (.components | type) == "array"
+              then (.components | length)
+            else error("components is not an array")
+            end' "${json_path}" 2> /dev/null)"; then
+            failure_reason="the generated JSON document has no usable"
+            failure_reason="${failure_reason} components array"
+          fi
+        fi
 
-        if [ "${syft_exit}" != "0" ]; then
-          echo "Syft exited with code ${syft_exit}"
+        if [ -n "${failure_reason}" ]; then
+          echo "SBOM generation failed: ${failure_reason}"
+          # Discard anything the backend produced. A rejected document
+          # is still a document: the unsupported-spec-version case
+          # writes a well-formed BOM carrying the wrong version, and a
+          # consumer uploading sbom-cyclonedx.* would publish and scan
+          # it even though this step reported failure. Removing the
+          # destinations keeps the failure contract honest in both
+          # directions - nothing is published, and the reported
+          # component_count of zero matches what is on disk.
+          #
+          # Unguarded, unlike the purge above: that purge already
+          # established these paths held no pre-existing file, so
+          # anything here now came from this run.
+          # Both, matching the purge above: a failed run must not
+          # leave either destination holding a document.
+          rm -f -- "${json_path}" "${xml_path}"
           {
             echo "## 📋 SBOM Generation Results"
             echo ""
-            echo "SBOM generation failed (syft exit ${syft_exit}) ❌"
+            echo "SBOM generation failed (${failure_reason}) ❌"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "${FAIL_ON_ERROR}" = "true" ]; then
             echo "::error::SBOM generation failed ❌"
@@ -304,8 +960,6 @@ runs:
           echo "component_count=0" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-
-        component_count=$(jq '.components // [] | length' "${json_path}")
 
         # Emit outputs; paths only for the formats the caller requested.
         # Path values derive from the caller-controlled output_directory
@@ -338,7 +992,10 @@ runs:
         {
           echo "## 📋 SBOM Generation Results"
           echo ""
-          echo "**Backend:** syft"
+          echo "**Backend:** ${BACKEND}"
+          if [ -n "${DEPENDENCY_MANAGER}" ]; then
+            echo "**Build Tool:** ${DEPENDENCY_MANAGER}"
+          fi
           echo "**Format:** ${SBOM_FORMAT}"
           echo "**Specification Version:** ${SPEC_VERSION}"
           echo "**Development Dependencies:** ${INCLUDE_DEV}"

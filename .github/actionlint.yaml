@@ -9,3 +9,11 @@ paths:
       # Ignore deliberate test failure
       - 'input "invalid_input" is not defined in action .+'
       - 'missing input "input" which is required by action .+'
+      # GitHub added the self-repository syntax (uses: $/...) in July
+      # 2026; actionlint does not recognise it yet and reports the
+      # missing @ref it would require of an external action. zizmor's
+      # self-repository audit requires this form, and the
+      # organisation's workflow audit blocks on every finding, so the
+      # two tools cannot both be satisfied without this suppression.
+      # Remove it once actionlint supports the syntax.
+      - 'specifying action "\$/" in invalid format because ref is missing.*'
