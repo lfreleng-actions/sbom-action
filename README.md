@@ -46,19 +46,19 @@ system it drives.
 | Backend          | Tool                             | Build tools driven | Needs a toolchain | Use for                                 |
 | ---------------- | -------------------------------- | ------------------ | ----------------- | --------------------------------------- |
 | `syft` (default) | syft static analysis             | none               | No                | Go, Node.js, Rust, containers, binaries |
-| `cyclonedx`      | CycloneDX build-tool plugins     | Maven              | JDK + build tool  | Java projects                           |
+| `cyclonedx`      | CycloneDX build-tool plugins     | Maven, Gradle      | JDK + build tool  | Java projects                           |
 
 <!-- markdownlint-enable MD013 -->
 
-That distinction matters for what comes next. `cyclonedx-gradle-plugin`
-is the same tool family solving the same problem, so Gradle support
-joins the **existing** `cyclonedx` backend rather than arriving as a
-separate `gradle` one. Callers keep the same `backend` value and the
-action detects the build system from the project.
+`cyclonedx-gradle-plugin` is the same tool family solving the same
+problem as `cyclonedx-maven-plugin`, so Gradle joins the **existing**
+`cyclonedx` backend rather than arriving as a separate one. Callers keep
+the same `backend` value, and the action resolves the build system from
+the project unless the caller declares it.
 
-Because the backend name no longer identifies the build system, the
-`dependency_manager` output reports which one actually ran (`maven`
-today). It stays empty for `syft`, which drives no build tool.
+Because the backend name does not identify the build system, the
+`dependency_manager` output reports which one ran (`maven` or `gradle`).
+It stays empty for `syft`, which drives no build tool.
 
 The `cyclonedx` backend fails fast when it cannot find a build system
 it supports, rather than attempting an invocation that cannot work.
@@ -269,11 +269,18 @@ The `syft` backend downloads the syft binary via the pinned
 `anchore/sbom-action/download-syft` helper, so runners need egress to
 GitHub release assets.
 
-The `cyclonedx` backend installs a JDK with `actions/setup-java` and uses
-the Maven installation from the runner image, so runners need egress to
-the JDK distribution and to the Maven repositories the project
-resolves against (Maven Central by default). Callers running
-`harden-runner` in `block` mode must allow-list those endpoints.
+The `cyclonedx` backend installs a JDK with `actions/setup-java`, so
+runners need egress to the JDK distribution and to the repositories the
+project resolves against (Maven Central by default). Gradle adds the
+Gradle distribution host, which the wrapper downloads from, and the
+Gradle Plugin Portal, where `cyclonedx-gradle-plugin` resolves from
+rather than Maven Central. Callers running `harden-runner` in `block`
+mode must allow-list those endpoints.
+
+For Maven the action uses the installation from the runner image. For
+Gradle it runs the project's `gradlew` where the checkout has one, and
+otherwise a `gradle` on `PATH` — so a project without a committed
+wrapper needs Gradle installed on the runner.
 
 That backend also needs **Maven 3.6.1 or later**. The plugin itself
 supports older Maven, but the action passes `--no-transfer-progress`
@@ -582,9 +589,9 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists. `maven_args` is **not** constrained this way — the action splits it on whitespace and rejects it solely for overriding action-owned properties, leaving it trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision, and detects the build system, failing fast on one it cannot drive before installing any toolchain
+1. **Input Validation**: Validates backend, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, and skips a Gradle version below the plugin's floor where the caller supplied one
 2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java`. The selected backend guards each step, so neither costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). The `cyclonedx` backend invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. In both cases the JSON document always gets generated internally to compute the component count
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. In both cases the JSON document always gets generated internally to compute the component count
 4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary
 
 <!-- markdownlint-enable MD013 -->

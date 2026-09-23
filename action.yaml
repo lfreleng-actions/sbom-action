@@ -1178,11 +1178,24 @@ runs:
                 # caller input is ever interpolated into code and
                 # paths with spaces need no quoting rules.
                 #
-                # Direct SBOMs are intermediates the aggregate reads.
-                # Left at their conventions they land in each
-                # project's build directory, so the action would
-                # leave reports inside a checkout it promises not to
-                # write into; both are redirected to scratch.
+                # Task configuration is registered from
+                # projectsEvaluated rather than at apply time.
+                # Configuration actions run in registration order, so
+                # one registered during init runs BEFORE a consumer's
+                # own 'tasks.named("cyclonedxDirectBom")' block and
+                # loses to it - which would put the reports back inside
+                # the checkout, the exact condition this avoids.
+                # Registering after every build script has been
+                # evaluated queues these last.
+                #
+                # Direct SBOMs are intermediates the combined document
+                # reads. Left at their conventions they land in each
+                # project's build directory, so both are redirected to
+                # scratch. Underscores are doubled into '_u' before ':'
+                # becomes '_c', which keeps the encoding injective:
+                # ':a_:b' and ':a:_b' would otherwise collide and one
+                # project's graph would vanish from the result.
+                init_script="${gradle_scratch}/cyclonedx-init.gradle"
                 {
                   echo "import org.cyclonedx.gradle.CyclonedxPlugin"
                   echo "import org.cyclonedx.Version"
@@ -1202,7 +1215,9 @@ runs:
                   echo ""
                   echo "rootProject {"
                   echo "  apply plugin: CyclonedxPlugin"
+                  echo "}"
                   echo ""
+                  echo "gradle.projectsEvaluated {"
                   echo "  def wanted = prop('schemaVersion')"
                   echo "  def schema = Version.values().find {"
                   echo "    it.versionString == wanted"
@@ -1213,19 +1228,23 @@ runs:
                   echo "  }"
                   echo "  def configs = prop('configs').split(',') as List"
                   echo "  def scratch = new File(prop('scratch'))"
+                  echo "  def root = gradle.rootProject"
                   echo ""
-                  echo "  allprojects {"
-                  echo "    tasks.named('cyclonedxDirectBom') {"
+                  echo "  root.allprojects { p ->"
+                  echo "    def direct = p.tasks.matching {"
+                  echo "      it.name == 'cyclonedxDirectBom'"
+                  echo "    }"
+                  echo "    direct.configureEach {"
                   echo "      includeConfigs = configs"
                   echo "      schemaVersion = schema"
-                  echo "      def s = project.path"
-                  echo "        .replace('_', '__').replace(':', '_')"
+                  echo "      def s = p.path"
+                  echo "        .replace('_', '_u').replace(':', '_c')"
                   echo "      def d = { e -> new File(scratch, s + e) }"
                   echo "      jsonOutput.fileValue(d('.json'))"
                   echo "      xmlOutput.fileValue(d('.xml'))"
                   echo "    }"
                   echo "  }"
-                  echo "  tasks.named('cyclonedxBom') {"
+                  echo "  root.tasks.named('cyclonedxBom') {"
                   echo "    schemaVersion = schema"
                   echo "    jsonOutput.fileValue(new File(prop('jsonOutput')))"
                   echo "    xmlOutput.fileValue(new File(prop('xmlOutput')))"
