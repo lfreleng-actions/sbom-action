@@ -415,6 +415,25 @@ distribution first.
 that the task names differ and the requested CycloneDX schema may not
 exist, so the run cannot yield a document worth scanning.
 
+The effective floor is the later of that and Gradle's own Java
+compatibility, because Gradle also has to run on the JDK this action
+installs. On the default `java_version: 21` Gradle reaches support at
+**8.5**, so that is the floor a default configuration applies:
+
+| `java_version` | Gradle floor   |
+| -------------- | -------------- |
+| 17 to 20       | 8.4            |
+| 21             | 8.5            |
+| 22             | 8.8            |
+| 23             | 8.10           |
+| 24             | 8.14           |
+| 25             | 9.1            |
+
+A `java_version` outside that range leaves the plugin's 8.4 standing
+alone: inventing a floor for a release whose compatibility nobody has
+recorded would be a guess, and Gradle reports an unsupported JVM well
+enough on its own.
+
 The action **skips** rather than fails. An SBOM audit is not essential
 to a build, other auditing tools exist, and failing a pipeline over a
 plugin's declared dependency would punish a project for something
@@ -480,12 +499,26 @@ format the caller did not request stays empty.
 drove, since the backend name identifies the tool rather than the build
 system. It stays empty for `syft`.
 
-`skipped` reports `true` when the action declined to generate, which
-today means an untrusted checkout. In that case `sbom_json_path`,
-`sbom_xml_path`, `component_count` and `dependency_manager` are all
-**empty**; `backend` still reports the backend the caller selected, as
-the validation step resolves it before the skip decision. See
-[Untrusted checkouts](#untrusted-checkouts).
+`skipped` reports `true` when the action declined to generate. Two
+conditions cause that:
+
+<!-- markdownlint-disable MD013 -->
+
+| Condition                        | `dependency_manager` | Documented at                                                                     |
+| -------------------------------- | -------------------- | --------------------------------------------------------------------------------- |
+| Untrusted checkout               | **empty**            | [Untrusted checkouts](#untrusted-checkouts)                                       |
+| Gradle below the effective floor | `gradle`             | [Gradle versions below the plugin floor](#gradle-versions-below-the-plugin-floor) |
+
+<!-- markdownlint-enable MD013 -->
+
+In both cases `sbom_json_path`, `sbom_xml_path` and `component_count`
+are **empty**, and `backend` still reports the backend the caller
+selected, since validation resolves it before either decision.
+
+`dependency_manager` differs between them because validation resolves
+the build system after the trust decision but before it can weigh the
+Gradle floor. A caller branching on a skip should read `skipped` rather
+than inferring it from empty build-tool metadata.
 
 ## Path Constraints
 

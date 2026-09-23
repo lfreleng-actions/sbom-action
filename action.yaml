@@ -451,6 +451,14 @@ runs:
         if [ "${skipped}" = "true" ]; then
           skip_reason="untrusted"
         fi
+        # Recorded before the build-tool resolution below, which can
+        # exit non-zero on a project this backend cannot drive. Waiting
+        # until after it would leave the output empty on that path, and
+        # a caller reading skipped would get nothing rather than the
+        # trust decision that was already made. The later write updates
+        # it where the Gradle floor changes the answer.
+        echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+        echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
 
         # Resolve which build tool the cyclonedx backend will drive.
         # The backend names the tool producing the document, not the
@@ -527,7 +535,37 @@ runs:
         # SBOM audit is not essential to a build, and failing a pipeline
         # over a plugin's declared dependency would punish a project for
         # something unrelated to its own code.
-        gradle_minimum="8.4"
+        # The effective floor is the later of two requirements, not just
+        # the plugin's. Gradle also has to run on the JDK this action
+        # installs, and Gradle's Java compatibility moved with each
+        # release: on the default java_version of 21, Gradle only became
+        # supported at 8.5, so a declared 8.4 would clear the plugin's
+        # requirement and then fail inside Gradle on an unsupported JVM
+        # - the confusing failure the skip exists to replace.
+        #
+        # A JDK this table does not name leaves the plugin floor
+        # standing alone. Inventing a requirement for a release whose
+        # compatibility is unknown would be a guess, and Gradle reports
+        # an unsupported JVM clearly enough on its own.
+        plugin_minimum="8.4"
+        case "${INPUT_JAVA_VERSION}" in
+          17) java_minimum="7.3" ;;
+          18) java_minimum="7.5" ;;
+          19) java_minimum="7.6" ;;
+          20) java_minimum="8.1" ;;
+          21) java_minimum="8.5" ;;
+          22) java_minimum="8.8" ;;
+          23) java_minimum="8.10" ;;
+          24) java_minimum="8.14" ;;
+          25) java_minimum="9.1" ;;
+          *) java_minimum="" ;;
+        esac
+        gradle_minimum="${plugin_minimum}"
+        if [ -n "${java_minimum}" ]; then
+          gradle_minimum="$(printf '%s\n%s\n' "${plugin_minimum}" \
+            "${java_minimum}" | sort -V | tail -1)"
+        fi
+
         if [ "${dependency_manager}" = "gradle" ] && \
           [ -n "${INPUT_GRADLE_VERSION}" ]; then
           oldest="$(printf '%s\n%s\n' "${INPUT_GRADLE_VERSION}" \
@@ -535,8 +573,10 @@ runs:
           if [ "${oldest}" != "${gradle_minimum}" ]; then
             echo "::warning::SBOM generation skipped: Gradle" \
               "${INPUT_GRADLE_VERSION} is older than" \
-              "${gradle_minimum}, which cyclonedx-gradle-plugin" \
-              "${INPUT_GRADLE_PLUGIN_VERSION} requires"
+              "${gradle_minimum}, required by" \
+              "cyclonedx-gradle-plugin" \
+              "${INPUT_GRADLE_PLUGIN_VERSION} on JDK" \
+              "${INPUT_JAVA_VERSION}"
             skipped="true"
             skip_reason="gradle-too-old"
           fi
@@ -544,6 +584,7 @@ runs:
         echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
         echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
         echo "gradle_version=${INPUT_GRADLE_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "gradle_minimum=${gradle_minimum}" >> "$GITHUB_OUTPUT"
 
     - name: "Download syft"
       id: syft
@@ -615,6 +656,9 @@ runs:
         INPUT_MAVEN_ARGS: ${{ inputs.maven_args }}
         GRADLE_PLUGIN_VERSION: ${{ inputs.gradle_plugin_version }}
         GRADLE_VERSION: ${{ inputs.gradle_version }}
+        # yamllint disable-line rule:line-length
+        GRADLE_MINIMUM: ${{ steps.validate.outputs.gradle_minimum }}
+        JAVA_VERSION: ${{ inputs.java_version }}
         # Shadowed for the same reason as MAVEN_ARGS. Gradle reads
         # GRADLE_OPTS and JAVA_OPTS from the environment rather than a
         # GRADLE_ARGS name, so the collision is weaker here, but the
@@ -1089,7 +1133,7 @@ runs:
                     ${gradle_cmd} --version 2>/dev/null) | \
                     awk '/^Gradle /{print $2; exit}')"
 
-                  gradle_minimum="8.4"
+                  gradle_minimum="${GRADLE_MINIMUM}"
                   gradle_too_old="false"
                   if [ -n "${gradle_actual}" ]; then
                     oldest="$(printf '%s\n%s\n' "${gradle_actual}" \
@@ -1109,9 +1153,10 @@ runs:
                   if [ "${gradle_too_old}" = "true" ]; then
                     echo "::warning::SBOM generation skipped: Gradle" \
                       "${gradle_actual} is older than" \
-                      "${gradle_minimum}, which" \
+                      "${gradle_minimum}, required by" \
                       "cyclonedx-gradle-plugin" \
-                      "${GRADLE_PLUGIN_VERSION} requires"
+                      "${GRADLE_PLUGIN_VERSION} on JDK" \
+                      "${JAVA_VERSION}"
                     {
                       echo "## 📋 SBOM Generation Results"
                       echo ""
