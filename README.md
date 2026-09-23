@@ -111,9 +111,9 @@ finding.
 
 ### Trust Boundary
 
-> ⚠️ **The `cyclonedx` backend requires a trusted checkout.** Running Maven
-> against a project treats that project as *executable input* rather
-> than as inert metadata.
+> ⚠️ **The `cyclonedx` backend requires a trusted checkout.** Running a
+> build tool against a project treats that project as *executable input*
+> rather than as inert metadata.
 
 Before the SBOM goal runs, Maven will:
 
@@ -121,9 +121,19 @@ Before the SBOM goal runs, Maven will:
 - load build extensions declared in the POM;
 - read command-line arguments from `.mvn/maven.config`.
 
-No command-line flag turns any of that off, and it happens even though
-the goal never compiles source or runs tests. A project supplying a
-core extension thus executes code in the job.
+Gradle goes further, because evaluating a build *is* running code:
+
+- `settings.gradle`/`settings.gradle.kts` and every `build.gradle`
+  script execute as Groovy or Kotlin during configuration;
+- `gradle.properties` can set JVM arguments for the build process;
+- where the checkout carries a wrapper, `gradlew` is a shell script from
+  the project and `gradle-wrapper.jar` is a binary it executes, which
+  the action runs in preference to any `gradle` on `PATH`.
+
+No command-line flag turns any of that off, and for Maven it happens
+even though the goal never compiles source or runs tests. A project
+supplying a core extension, a build script or a wrapper thus executes
+code in the job.
 
 This is a real difference from the `syft` backend, which reads files
 and executes nothing from the project.
@@ -279,8 +289,16 @@ mode must allow-list those endpoints.
 
 For Maven the action uses the installation from the runner image. For
 Gradle it runs the project's `gradlew` where the checkout has one, and
-otherwise a `gradle` on `PATH` — so a project without a committed
-wrapper needs Gradle installed on the runner.
+otherwise a `gradle` on `PATH`.
+
+A project without a committed wrapper needs Gradle installed on the
+runner. GitHub-hosted images ship one; a self-hosted runner may not.
+Where neither is present the run fails with Gradle's own "command not
+found", which `fail_on_error: false` downgrades to a warning — so a
+missing toolchain need not fail the job. Committing a wrapper is the
+better remedy: it pins the Gradle version the project asks for rather
+than whichever the runner happens to carry, and `gradle-build-action`
+expects one.
 
 That backend also needs **Maven 3.6.1 or later**. The plugin itself
 supports older Maven, but the action passes `--no-transfer-progress`
@@ -561,9 +579,24 @@ have no development scope, so the input has no effect there. Further
 per-ecosystem scoping options join the mapping as syft exposes them.
 
 The cyclonedx backend maps `include_dev` onto the plugin's
-`includeTestScope`. Maven's `test` scope is the analogue of npm
-`devDependencies`: absent from the running application, and so
+`includeTestScope` for Maven. Maven's `test` scope is the analogue of
+npm `devDependencies`: absent from the running application, and so
 excluded by default.
+
+Gradle has configurations rather than scopes, so the mapping names them
+directly. By default the backend scans `compileClasspath` and
+`runtimeClasspath`; `include_dev` adds `testCompileClasspath` and
+`testRuntimeClasspath`.
+
+Naming them matters. Left unrestricted the plugin scans **every**
+resolvable configuration, which pulls in tool classpaths such as
+`jacocoAnt` and the ASM it carries — build tooling absent from the
+shipped artefact, and noise in a vulnerability report. Measured against
+the Gradle fixture: 6 components scoped, 24 unscoped.
+
+A project using custom configurations for its runtime classpath should
+supply them through `gradle_args`, since the backend cannot infer which
+of an arbitrary set carries shipped dependencies.
 
 The plugin's other scope defaults stay as they are — `compile`,
 `runtime`, **`provided`** and **`system`** all enabled — so the BOM

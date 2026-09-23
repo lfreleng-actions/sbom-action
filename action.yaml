@@ -548,7 +548,12 @@ runs:
         # compatibility is unknown would be a guess, and Gradle reports
         # an unsupported JVM clearly enough on its own.
         plugin_minimum="8.4"
-        case "${INPUT_JAVA_VERSION}" in
+        # Reduced to the major before the lookup, since java_version
+        # accepts a full version: setup-java takes '21.0.5' as readily
+        # as '21', and matching the whole string would miss the table
+        # and silently leave the plugin floor standing alone.
+        java_major="${INPUT_JAVA_VERSION%%.*}"
+        case "${java_major}" in
           17) java_minimum="7.3" ;;
           18) java_minimum="7.5" ;;
           19) java_minimum="7.6" ;;
@@ -1276,7 +1281,16 @@ runs:
                   echo "def configs = prop('configs').split(',') as List"
                   echo "def scratch = new File(prop('scratch'))"
                   echo ""
-                  echo "def configureDirect = { p ->"
+                  echo "def setOutputs = { t, j, x, seal ->"
+                  echo "  t.jsonOutput.fileValue(j)"
+                  echo "  t.xmlOutput.fileValue(x)"
+                  echo "  if (seal) {"
+                  echo "    t.jsonOutput.disallowChanges()"
+                  echo "    t.xmlOutput.disallowChanges()"
+                  echo "  }"
+                  echo "}"
+                  echo ""
+                  echo "def configureDirect = { p, seal ->"
                   echo "  def direct = p.tasks.matching {"
                   echo "    it.name == 'cyclonedxDirectBom'"
                   echo "  }"
@@ -1286,16 +1300,15 @@ runs:
                   echo "    def s = p.path"
                   echo "      .replace('_', '_u').replace(':', '_c')"
                   echo "    def d = { e -> new File(scratch, s + e) }"
-                  echo "    jsonOutput.fileValue(d('.json'))"
-                  echo "    xmlOutput.fileValue(d('.xml'))"
+                  echo "    setOutputs(delegate, d('.json'), d('.xml'), seal)"
                   echo "  }"
                   echo "}"
                   echo ""
-                  echo "def configureCombined = { root ->"
+                  echo "def configureCombined = { root, seal ->"
                   echo "  root.tasks.named('cyclonedxBom') {"
                   echo "    schemaVersion = schema"
-                  echo "    jsonOutput.fileValue(new File(prop('jsonOutput')))"
-                  echo "    xmlOutput.fileValue(new File(prop('xmlOutput')))"
+                  echo "    setOutputs(delegate, new File(prop('jsonOutput')),"
+                  echo "      new File(prop('xmlOutput')), seal)"
                   echo "  }"
                   echo "}"
                   echo ""
@@ -1305,14 +1318,14 @@ runs:
                   echo "      'plugin cannot emit CycloneDX ' + wanted)"
                   echo "  }"
                   echo "  apply plugin: CyclonedxPlugin"
-                  echo "  allprojects { configureDirect(it) }"
-                  echo "  configureCombined(delegate)"
+                  echo "  allprojects { configureDirect(it, false) }"
+                  echo "  configureCombined(delegate, false)"
                   echo "}"
                   echo ""
                   echo "gradle.projectsEvaluated {"
                   echo "  def root = gradle.rootProject"
-                  echo "  root.allprojects { configureDirect(it) }"
-                  echo "  configureCombined(root)"
+                  echo "  root.allprojects { configureDirect(it, true) }"
+                  echo "  configureCombined(root, true)"
                   echo "}"
                 } > "${init_script}"
 
