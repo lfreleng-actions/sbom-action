@@ -850,8 +850,9 @@ runs:
               echo "This project builds with Gradle"
               echo "\`${GRADLE_VERSION}\`, and"
               echo "\`cyclonedx-gradle-plugin\`"
-              echo "\`${GRADLE_PLUGIN_VERSION}\` requires \`8.4\` or"
-              echo "newer."
+              echo "\`${GRADLE_PLUGIN_VERSION}\` on JDK"
+              echo "\`${JAVA_VERSION}\` requires"
+              echo "\`${GRADLE_MINIMUM}\` or newer."
               echo ""
               echo "No document was written and no counts are"
               echo "reported: a partial or lower-fidelity SBOM would"
@@ -1129,9 +1130,17 @@ runs:
                 # the distribution first.
                 gradle_actual="${GRADLE_VERSION}"
                 if [ -z "${gradle_actual}" ]; then
+                  # Non-fatal: this step runs under 'set -e', so a
+                  # missing gradle, a failed wrapper download or a JVM
+                  # that will not start would exit here and bypass
+                  # fail_on_error entirely. Leaving the probe empty
+                  # lets the guarded invocation below record the real
+                  # exit status and route it through the usual handler.
+                  set +e
                   gradle_actual="$( (cd "${PROJECT_DIR}" && \
                     ${gradle_cmd} --version 2>/dev/null) | \
                     awk '/^Gradle /{print $2; exit}')"
+                  set -e
 
                   gradle_minimum="${GRADLE_MINIMUM}"
                   gradle_too_old="false"
@@ -1223,23 +1232,25 @@ runs:
                 # caller input is ever interpolated into code and
                 # paths with spaces need no quoting rules.
                 #
-                # Task configuration is registered from
-                # projectsEvaluated rather than at apply time.
-                # Configuration actions run in registration order, so
-                # one registered during init runs BEFORE a consumer's
-                # own 'tasks.named("cyclonedxDirectBom")' block and
-                # loses to it - which would put the reports back inside
-                # the checkout, the exact condition this avoids.
-                # Registering after every build script has been
-                # evaluated queues these last.
+                # Task settings are applied twice, deliberately. The
+                # early pass runs before the plugin's own afterEvaluate
+                # wiring, which snapshots each task's output files into
+                # the combined document; without it that document would
+                # resolve the default build/reports paths while the
+                # tasks themselves wrote to scratch. The late pass
+                # repeats the same values after every build script has
+                # been evaluated, so a consumer configuring these tasks
+                # cannot displace them. Configuration actions run in
+                # registration order, and one registered while the init
+                # script applies the plugin would otherwise lose.
                 #
                 # Direct SBOMs are intermediates the combined document
                 # reads. Left at their conventions they land in each
                 # project's build directory, so both are redirected to
-                # scratch. Underscores are doubled into '_u' before ':'
-                # becomes '_c', which keeps the encoding injective:
-                # ':a_:b' and ':a:_b' would otherwise collide and one
-                # project's graph would vanish from the result.
+                # scratch. Underscores become '_u' before ':' becomes
+                # '_c', which keeps the encoding injective: ':a_:b' and
+                # ':a:_b' would otherwise collide and one project's
+                # graph would vanish from the result.
                 init_script="${gradle_scratch}/cyclonedx-init.gradle"
                 {
                   echo "import org.cyclonedx.gradle.CyclonedxPlugin"
@@ -1258,42 +1269,50 @@ runs:
                   echo "  System.getProperty('sbomAction.' + k)"
                   echo "}"
                   echo ""
-                  echo "rootProject {"
-                  echo "  apply plugin: CyclonedxPlugin"
+                  echo "def wanted = prop('schemaVersion')"
+                  echo "def schema = Version.values().find {"
+                  echo "  it.versionString == wanted"
+                  echo "}"
+                  echo "def configs = prop('configs').split(',') as List"
+                  echo "def scratch = new File(prop('scratch'))"
+                  echo ""
+                  echo "def configureDirect = { p ->"
+                  echo "  def direct = p.tasks.matching {"
+                  echo "    it.name == 'cyclonedxDirectBom'"
+                  echo "  }"
+                  echo "  direct.configureEach {"
+                  echo "    includeConfigs = configs"
+                  echo "    schemaVersion = schema"
+                  echo "    def s = p.path"
+                  echo "      .replace('_', '_u').replace(':', '_c')"
+                  echo "    def d = { e -> new File(scratch, s + e) }"
+                  echo "    jsonOutput.fileValue(d('.json'))"
+                  echo "    xmlOutput.fileValue(d('.xml'))"
+                  echo "  }"
                   echo "}"
                   echo ""
-                  echo "gradle.projectsEvaluated {"
-                  echo "  def wanted = prop('schemaVersion')"
-                  echo "  def schema = Version.values().find {"
-                  echo "    it.versionString == wanted"
-                  echo "  }"
-                  echo "  if (schema == null) {"
-                  echo "    throw new GradleException("
-                  echo "      'plugin cannot emit CycloneDX ' + wanted)"
-                  echo "  }"
-                  echo "  def configs = prop('configs').split(',') as List"
-                  echo "  def scratch = new File(prop('scratch'))"
-                  echo "  def root = gradle.rootProject"
-                  echo ""
-                  echo "  root.allprojects { p ->"
-                  echo "    def direct = p.tasks.matching {"
-                  echo "      it.name == 'cyclonedxDirectBom'"
-                  echo "    }"
-                  echo "    direct.configureEach {"
-                  echo "      includeConfigs = configs"
-                  echo "      schemaVersion = schema"
-                  echo "      def s = p.path"
-                  echo "        .replace('_', '_u').replace(':', '_c')"
-                  echo "      def d = { e -> new File(scratch, s + e) }"
-                  echo "      jsonOutput.fileValue(d('.json'))"
-                  echo "      xmlOutput.fileValue(d('.xml'))"
-                  echo "    }"
-                  echo "  }"
+                  echo "def configureCombined = { root ->"
                   echo "  root.tasks.named('cyclonedxBom') {"
                   echo "    schemaVersion = schema"
                   echo "    jsonOutput.fileValue(new File(prop('jsonOutput')))"
                   echo "    xmlOutput.fileValue(new File(prop('xmlOutput')))"
                   echo "  }"
+                  echo "}"
+                  echo ""
+                  echo "rootProject {"
+                  echo "  if (schema == null) {"
+                  echo "    throw new GradleException("
+                  echo "      'plugin cannot emit CycloneDX ' + wanted)"
+                  echo "  }"
+                  echo "  apply plugin: CyclonedxPlugin"
+                  echo "  allprojects { configureDirect(it) }"
+                  echo "  configureCombined(delegate)"
+                  echo "}"
+                  echo ""
+                  echo "gradle.projectsEvaluated {"
+                  echo "  def root = gradle.rootProject"
+                  echo "  root.allprojects { configureDirect(it) }"
+                  echo "  configureCombined(root)"
                   echo "}"
                 } > "${init_script}"
 
@@ -1327,10 +1346,10 @@ runs:
                         # validated and describe it in an SBOM labelled
                         # with path_prefix. An extra init script could
                         # equally reconfigure the task this one sets up.
-                        -p|-p=*|--project-dir|--project-dir=*|\
-                        -c|-c=*|--settings-file|--settings-file=*|\
-                        -b|-b=*|--build-file|--build-file=*|\
-                        -I|-I=*|--init-script|--init-script=*|\
+                        -p|-p?*|--project-dir|--project-dir=*|\
+                        -c|-c?*|--settings-file|--settings-file=*|\
+                        -b|-b?*|--build-file|--build-file=*|\
+                        -I|-I?*|--init-script|--init-script=*|\
                         --include-build|--include-build=*)
                           echo "Error: gradle_args may not select an" \
                             "alternate project ❌"
