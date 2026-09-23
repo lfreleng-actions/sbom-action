@@ -543,6 +543,272 @@ jobs:
             echo "With test scope: ${DEV_COUNT}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+
+  ### Test the cyclonedx backend against Gradle ###
+  # Gradle is worse off than Maven before this backend: syft catalogs
+  # gradle.lockfile and nothing else, and dependency locking is opt-in,
+  # so a typical Gradle project yields no third-party components at all
+  # rather than a partial graph. Measured against the fixture below,
+  # syft finds zero where this backend finds six.
+  # See lfreleng-actions/java-workflows#48.
+  test-cyclonedx-gradle:
+    name: "Test: cyclonedx backend (Gradle)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+
+      # Block, as everywhere else here. The shared allow-list carries
+      # Maven Central, api.adoptium.net, services.gradle.org for the
+      # wrapper distribution, and plugins.gradle.org for the plugin
+      # itself, which resolves from the portal rather than Central.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Multi-project reactor whose core module declares jackson-databind
+      # with no version of its own, supplied by an imported platform.
+      # One declared coordinate, three resolved components, and the root
+      # is Groovy DSL while app is Kotlin DSL, so both dialects are
+      # exercised by one build.
+      - name: "Checkout test project: lfreleng-actions/test-gradle-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-gradle-project
+          # yamllint disable-line rule:line-length
+          ref: ad91147966624cff011fd98dd5f1b4ed24429e60 # v0.0.1
+          path: test-project
+          persist-credentials: false
+
+      - name: "Running local action: Gradle, detected"
+        id: gradle
+        uses: $/
+        with:
+          backend: cyclonedx
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-gradle
+          # As in the Maven job: the tree being scanned is an immutable
+          # org-owned commit, not this pull request's content.
+          untrusted_checkout: 'false'
+
+      # The same project with the build tool declared rather than
+      # detected, which is how java-workflows calls this action: the
+      # lane already knows, so it does not ask.
+      - name: "Running local action: Gradle, declared"
+        id: gradle-declared
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          dependency_manager: gradle
+          path_prefix: test-project
+          sbom_format: both
+          filename_prefix: sbom-gradle-declared
+          output_directory: gradle-both-out
+
+      - name: "Running local action: Gradle with test configurations"
+        id: gradle-dev
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-gradle-dev
+          include_dev: 'true'
+
+      # Below the plugin's floor the action skips rather than fails: an
+      # SBOM audit is not essential to a build, and failing a pipeline
+      # over a plugin's declared dependency would punish a project for
+      # something unrelated to its code.
+      - name: "Running local action: Gradle below the plugin floor"
+        id: gradle-too-old
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-gradle-old
+          gradle_version: '8.0'
+
+      - name: "Running local action: gradle_args escape rejected"
+        id: gradle-args-escape
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          gradle_args: '-p /tmp/escape'
+
+      - name: "Running local action: gradle_args override rejected"
+        id: gradle-args-override
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          gradle_args: '-DsbomAction.configs=everything'
+
+      # Declaring a build tool the checkout does not carry is a caller
+      # error, not something to paper over: the backend would drive a
+      # tool this project does not use.
+      - name: "Running local action: wrong build tool declared"
+        id: gradle-wrong-tool
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          dependency_manager: maven
+          path_prefix: test-project
+
+      - name: "Verify the resolved Gradle dependency graph"
+        shell: bash
+        env:
+          GRADLE_JSON: ${{ steps.gradle.outputs.sbom_json_path }}
+          GRADLE_COUNT: ${{ steps.gradle.outputs.component_count }}
+          # yamllint disable-line rule:line-length
+          GRADLE_MANAGER: ${{ steps.gradle.outputs.dependency_manager }}
+          GRADLE_BACKEND: ${{ steps.gradle.outputs.backend }}
+          # yamllint disable-line rule:line-length
+          DECLARED_JSON: ${{ steps.gradle-declared.outputs.sbom_json_path }}
+          # yamllint disable-line rule:line-length
+          DECLARED_XML: ${{ steps.gradle-declared.outputs.sbom_xml_path }}
+          DEV_COUNT: ${{ steps.gradle-dev.outputs.component_count }}
+          OLD_SKIPPED: ${{ steps.gradle-too-old.outputs.skipped }}
+          OLD_COUNT: ${{ steps.gradle-too-old.outputs.component_count }}
+          # yamllint disable-line rule:line-length
+          ESCAPE_OUTCOME: ${{ steps.gradle-args-escape.outcome }}
+          # yamllint disable-line rule:line-length
+          OVERRIDE_OUTCOME: ${{ steps.gradle-args-override.outcome }}
+          # yamllint disable-line rule:line-length
+          WRONG_TOOL_OUTCOME: ${{ steps.gradle-wrong-tool.outcome }}
+          PROJECT_DIR: test-project
+        run: |
+          # Verify the Gradle path of the cyclonedx backend
+          failures=0
+          fail() {
+            # Reads $* rather than $1: several call sites split their
+            # message across arguments to stay inside the line limit,
+            # and reading only the first would report half of it.
+            echo "::error::$*"
+            failures=$((failures + 1))
+          }
+
+          [ "${GRADLE_BACKEND}" = "cyclonedx" ] || \
+            fail "backend output was '${GRADLE_BACKEND}'"
+          [ "${GRADLE_MANAGER}" = "gradle" ] || \
+            fail "dependency_manager was '${GRADLE_MANAGER}'"
+
+          # The declared coordinate carries no version of its own, so a
+          # generator reading the build script as text cannot resolve
+          # it. Asserting the versions, not merely the names, is what
+          # separates a resolved graph from a parsed one.
+          for coord in \
+            "com.fasterxml.jackson.core:jackson-databind:2.22.2" \
+            "com.fasterxml.jackson.core:jackson-core:2.22.2" \
+            "com.fasterxml.jackson.core:jackson-annotations:2.22"; do
+            group="${coord%%:*}"
+            rest="${coord#*:}"
+            name="${rest%%:*}"
+            version="${rest#*:}"
+            if ! jq -e --arg g "${group}" --arg n "${name}" \
+              --arg v "${version}" '
+              [.components[]? | select(.group == $g and .name == $n
+                and .version == $v)] | length > 0
+            ' "${GRADLE_JSON}" >/dev/null; then
+              fail "missing resolved component ${coord}"
+            fi
+          done
+
+          # jackson-annotations resolves to 2.22 while the others resolve
+          # to 2.22.2, so a generator cannot fake the graph by copying
+          # one version across every entry.
+          if ! jq -e '
+            [.components[]? | select(.group | startswith("com.fasterxml"))
+              | .version] | unique | length > 1
+          ' "${GRADLE_JSON}" >/dev/null; then
+            fail "every jackson component carries the same version"
+          fi
+
+          # No component may carry an unresolved version: that is the
+          # exact failure mode this backend exists to remove.
+          if jq -e '
+            [.components[]? | select((.version // "") == ""
+              or .version == "UNKNOWN")] | length > 0
+          ' "${GRADLE_JSON}" >/dev/null; then
+            fail "a component carries an empty or UNKNOWN version"
+          fi
+
+          # Including test configurations must widen the graph, or
+          # include_dev is not reaching the plugin.
+          if [ "${DEV_COUNT}" -le "${GRADLE_COUNT}" ]; then
+            fail "include_dev did not widen the graph" \
+              "(${DEV_COUNT} vs ${GRADLE_COUNT})"
+          fi
+
+          # Declaring the build tool must produce the same graph as
+          # detecting it.
+          declared_count="$(jq '[.components[]?] | length' "${DECLARED_JSON}")"
+          if [ "${declared_count}" != "${GRADLE_COUNT}" ]; then
+            fail "declared run found ${declared_count}," \
+              "detected found ${GRADLE_COUNT}"
+          fi
+          [ -f "${DECLARED_XML}" ] || fail "both-format run wrote no XML"
+
+          # Below the floor: skipped, with no document and no count.
+          [ "${OLD_SKIPPED}" = "true" ] || \
+            fail "an unsupported Gradle version was not skipped"
+          [ -z "${OLD_COUNT}" ] || \
+            fail "a skipped run reported a component count"
+
+          for check in "ESCAPE_OUTCOME:${ESCAPE_OUTCOME}" \
+            "OVERRIDE_OUTCOME:${OVERRIDE_OUTCOME}" \
+            "WRONG_TOOL_OUTCOME:${WRONG_TOOL_OUTCOME}"; do
+            if [ "${check#*:}" != "failure" ]; then
+              fail "${check%%:*} was '${check#*:}', expected failure"
+            fi
+          done
+
+          # The action drives the project's own build tool, so Gradle
+          # creates build directories. What it must not do is leave its
+          # own reports behind in them for an artifact glob to collect.
+          strays="$(find "${PROJECT_DIR}" -path '*reports/cyclonedx*' \
+            \( -name 'bom.json' -o -name 'bom.xml' \) | wc -l)"
+          if [ "${strays}" != "0" ]; then
+            fail "${strays} plugin reports left inside the checkout"
+          fi
+
+          if [ "${failures}" != "0" ]; then
+            echo "Gradle backend verification failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Gradle backend verified: ${GRADLE_COUNT} components ✅"
+          {
+            echo "Gradle backend verified ✅"
+            echo "Shipped components: ${GRADLE_COUNT}"
+            echo "With test configurations: ${DEV_COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ### Test invalid inputs fail closed ###
   test-failures:
     name: "Test: invalid inputs and error handling"

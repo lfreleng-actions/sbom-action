@@ -317,15 +317,42 @@ them on every run so a typo surfaces regardless of the backend in use.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Required | Default   | Description                                                     |
-| -------------------- | -------- | --------- | --------------------------------------------------------------- |
-| java_version         | False    | `21`      | JDK version for the cyclonedx backend                           |
-| java_distribution    | False    | `temurin` | JDK distribution for the cyclonedx backend                      |
-| maven_plugin_version | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer              |
-| maven_args           | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace |
-| untrusted_checkout   | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`            |
+| Name                  | Required | Default   | Description                                                      |
+| --------------------- | -------- | --------- | ---------------------------------------------------------------- |
+| dependency_manager    | False    | `auto`    | Build tool: `auto`, `maven` or `gradle`                          |
+| java_version          | False    | `21`      | JDK version for the cyclonedx backend                            |
+| java_distribution     | False    | `temurin` | JDK distribution for the cyclonedx backend                       |
+| maven_plugin_version  | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer               |
+| maven_args            | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace  |
+| gradle_plugin_version | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer              |
+| gradle_version        | False    | `''`      | Gradle version the project uses; empty asks the build tool       |
+| gradle_args           | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace |
+| untrusted_checkout    | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`             |
 
 <!-- markdownlint-enable MD013 -->
+
+#### Choosing the build tool
+
+Left at `auto`, the action reads the project directory: a `pom.xml`
+selects Maven, a Gradle build script selects Gradle, and a tree carrying
+both resolves as Maven.
+
+That last case is a guess about intent, and a caller often knows better.
+A reusable workflow dedicated to one build tool always does, because the
+caller chose that workflow. `build-metadata-action` reports the same
+fact as `build_tool`, so a lane can pass it straight through:
+
+```yaml
+- uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    backend: cyclonedx
+    dependency_manager: gradle
+```
+
+A declared value still has to describe the checkout. Naming `maven` for
+a tree with no `pom.xml` fails with that explanation, rather than
+surfacing a confusing error from inside a build tool the project does
+not use.
 
 Use `maven_args` for project-specific resolution needs, for example a
 managed settings file (`-s .mvn/settings.xml`) or repository
@@ -347,6 +374,46 @@ remain authoritative even for an override form the rejection does not
 recognise. Without that, a redirected `outputDirectory` would write
 outside the validated output directory and leave the reported paths and
 component count pointing at files that were never generated.
+
+#### Gradle specifics
+
+`gradle_args` carries the same warning and the same protections as
+`maven_args`: it splits on whitespace without shell evaluation, but
+Gradle accepts arguments that change which build runs. The action
+rejects `-p`, `-c`, `-b` and `-I` in every spelling, because each
+selects a different project, settings file, build file or init script —
+any of which would resolve a build outside the validated directory and
+describe it in an SBOM labelled with `path_prefix`. It also rejects any
+`-D` naming an `sbomAction.*` property, which is how the action passes
+its own configuration.
+
+An init script applies the plugin, so the consumer's build files need no
+entry. Unlike the Maven branch, which invokes a goal directly, Gradle
+configures the build and so creates `.gradle/` and `build/` directories
+in the checkout. That is inherent to running Gradle at all. What the
+action does prevent is the plugin leaving its own reports there: it
+redirects both the combined document and the per-project intermediates,
+keeping an artifact glob from collecting a report the caller never
+asked for.
+
+`gradle_version` exists for the floor check described below. Supplying
+it — from `build-metadata-action`'s `java_gradle_version`, for example —
+settles the question before the action downloads anything. Left empty,
+the action asks the build tool, which is authoritative but pays for the
+distribution first.
+
+#### Gradle versions below the plugin floor
+
+`cyclonedx-gradle-plugin` 3.x requires **Gradle 8.4 or newer**. Below
+that the task names differ and the requested CycloneDX schema may not
+exist, so the run cannot yield a document worth scanning.
+
+The action **skips** rather than fails. An SBOM audit is not essential
+to a build, other auditing tools exist, and failing a pipeline over a
+plugin's declared dependency would punish a project for something
+unrelated to its own code. The run reports why, `skipped` returns
+`true`, and the action writes no document and reports no count — leaving
+the project free to raise its wrapper version and get results.
 
 ## Verification After Generation
 
