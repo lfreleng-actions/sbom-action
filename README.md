@@ -384,6 +384,25 @@ component count pointing at files that were never generated.
 
 #### Gradle specifics
 
+The action runs `cyclonedxBom` on the root project, which combines the
+per-project documents from **every** project in the build, including
+nested ones. A grandchild such as `:app:nested` contributes its own
+dependencies to the result, not merely its project component — measured
+against a fixture whose nested module carries a coordinate nothing else
+in the build uses:
+
+```text
+cyclonedxBom
+cyclonedxDirectBom
+app:cyclonedxDirectBom
+app:nested:cyclonedxDirectBom
+core:cyclonedxDirectBom
+```
+
+That topology is worth stating because tooling which walks a Gradle
+build often stops at the root's immediate subprojects, and a flat
+reactor cannot tell the two behaviours apart.
+
 `gradle_args` carries the same warning and the same protections as
 `maven_args`: it splits on whitespace without shell evaluation, but
 Gradle accepts arguments that change which build runs. The action
