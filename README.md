@@ -594,9 +594,15 @@ resolvable configuration, which pulls in tool classpaths such as
 shipped artefact, and noise in a vulnerability report. Measured against
 the Gradle fixture: 6 components scoped, 24 unscoped.
 
-A project using custom configurations for its runtime classpath should
-supply them through `gradle_args`, since the backend cannot infer which
-of an arbitrary set carries shipped dependencies.
+**Custom configurations are not selectable.** The backend names
+`compileClasspath` and `runtimeClasspath` (plus the test pair under
+`include_dev`), and `gradle_args` cannot change that: the init script
+assigns `includeConfigs` from that fixed list, and the action rejects
+any `-DsbomAction.*` override. A project whose shipped dependencies
+live in a configuration outside that set sees them absent from the
+document rather than reported wrongly — so the count runs low rather
+than misleading, though it remains incomplete. Selecting configurations
+needs a dedicated input, which this action does not yet have.
 
 The plugin's other scope defaults stay as they are — `compile`,
 `runtime`, **`provided`** and **`system`** all enabled — so the BOM
