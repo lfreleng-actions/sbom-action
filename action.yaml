@@ -139,11 +139,13 @@ outputs:
   skipped:
     # yamllint disable-line rule:line-length
     description: "True when generation was skipped; no SBOM exists and counts are empty"
-    # Emitted by generate rather than validate: an untrusted checkout is
-    # known before generation starts, but a Gradle version below the
-    # plugin's floor only becomes apparent once the build tool can be
-    # asked. Both routes report through the same output.
-    value: ${{ steps.generate.outputs.skipped }}
+    # Generation reports this where it can, because a Gradle version
+    # below the plugin's floor only emerges once the action can ask the
+    # build tool. Validation's decision is the fallback: it also covers
+    # the runs where generation never reported one, such as a validation
+    # failure that stops the step from running at all.
+    # yamllint disable-line rule:line-length
+    value: ${{ steps.generate.outputs.skipped || steps.validate.outputs.skipped }}
 
 runs:
   using: "composite"
@@ -321,12 +323,20 @@ runs:
           echo "the CycloneDX schema below what this action requests"
           exit 1
         fi
-        # Empty means "ask the build tool"; anything else has to look
-        # like a Gradle version, since it is compared against the
-        # plugin's floor.
+        # Empty means "ask the build tool". Anything else is compared
+        # against the plugin's floor, so it has to be a version: a bare
+        # word such as 'latest' would sort against 8.4 and be treated as
+        # supported, turning the check into a coin toss.
         case "${INPUT_GRADLE_VERSION}" in
           '') ;;
-          *[!0-9A-Za-z.-]*|.*|*.|*..*)
+          [0-9]*)
+            case "${INPUT_GRADLE_VERSION}" in
+              *[!0-9A-Za-z.-]*|*..*|*.)
+                echo "Error: invalid gradle_version ❌"
+                echo "Expected a Gradle version such as 8.14.2"
+                exit 1 ;;
+            esac ;;
+          *)
             echo "Error: invalid gradle_version ❌"
             echo "Expected a Gradle version such as 8.14.2"
             exit 1 ;;
@@ -436,7 +446,11 @@ runs:
           [ "${untrusted}" = "true" ]; then
           skipped="true"
         fi
-        echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+
+        skip_reason=""
+        if [ "${skipped}" = "true" ]; then
+          skip_reason="untrusted"
+        fi
 
         # Resolve which build tool the cyclonedx backend will drive.
         # The backend names the tool producing the document, not the
@@ -499,6 +513,38 @@ runs:
         fi
         echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
 
+        # Now that the build tool is known, a supplied Gradle version
+        # settles the plugin's floor here, before the JDK download
+        # rather than after it. Deciding in generate would provision a
+        # toolchain for a run already known to produce nothing. Where no
+        # version was supplied the decision waits until generate can ask
+        # the build tool.
+        #
+        # Gated on the resolved tool: a gradle_version left set while
+        # scanning a Maven project must not skip that project.
+        #
+        # Skipping rather than failing for the same reason as above: an
+        # SBOM audit is not essential to a build, and failing a pipeline
+        # over a plugin's declared dependency would punish a project for
+        # something unrelated to its own code.
+        gradle_minimum="8.4"
+        if [ "${dependency_manager}" = "gradle" ] && \
+          [ -n "${INPUT_GRADLE_VERSION}" ]; then
+          oldest="$(printf '%s\n%s\n' "${INPUT_GRADLE_VERSION}" \
+            "${gradle_minimum}" | sort -V | head -1)"
+          if [ "${oldest}" != "${gradle_minimum}" ]; then
+            echo "::warning::SBOM generation skipped: Gradle" \
+              "${INPUT_GRADLE_VERSION} is older than" \
+              "${gradle_minimum}, which cyclonedx-gradle-plugin" \
+              "${INPUT_GRADLE_PLUGIN_VERSION} requires"
+            skipped="true"
+            skip_reason="gradle-too-old"
+          fi
+        fi
+        echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+        echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+        echo "gradle_version=${INPUT_GRADLE_VERSION}" >> "$GITHUB_OUTPUT"
+
     - name: "Download syft"
       id: syft
       # yamllint disable-line rule:line-length
@@ -543,6 +589,7 @@ runs:
         BACKEND: ${{ inputs.backend }}
         DEPENDENCY_MANAGER: ${{ steps.validate.outputs.dependency_manager }}
         SKIPPED: ${{ steps.validate.outputs.skipped }}
+        SKIP_REASON: ${{ steps.validate.outputs.skip_reason }}
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}
         PROJECT_DIR: ${{ inputs.path_prefix }}
         SBOM_FORMAT: ${{ inputs.sbom_format }}
@@ -748,6 +795,31 @@ runs:
         # sbom-cyclonedx.json would otherwise survive the skip and be
         # published by the caller's artifact glob.
         if [ "${SKIPPED}" = "true" ]; then
+          if [ "${SKIP_REASON}" = "gradle-too-old" ]; then
+            # Validation reported this one already, before the toolchain
+            # was provisioned, so only the summary is left to write.
+            {
+              echo "## 📋 SBOM Generation Results"
+              echo ""
+              echo "SBOM generation skipped ⏭️"
+              echo ""
+              echo "This project builds with Gradle"
+              echo "\`${GRADLE_VERSION}\`, and"
+              echo "\`cyclonedx-gradle-plugin\`"
+              echo "\`${GRADLE_PLUGIN_VERSION}\` requires \`8.4\` or"
+              echo "newer."
+              echo ""
+              echo "No document was written and no counts are"
+              echo "reported: a partial or lower-fidelity SBOM would"
+              echo "read as a clean result."
+              echo ""
+              echo "Raising the Gradle version in"
+              echo "\`gradle/wrapper/gradle-wrapper.properties\`"
+              echo "enables the scan."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "::warning::SBOM generation skipped: the ${BACKEND}" \
             "backend executes code from the checkout, which is not" \
             "trusted here"
@@ -779,11 +851,21 @@ runs:
         # outputs: downstream consumers (such as a Grype audit job)
         # can only rely on the JSON document when the caller requests
         # the json or both formats
+        # One trap for every scratch directory this step may create.
+        # A second 'trap ... EXIT' REPLACES the first rather than adding
+        # to it, so installing one per directory would silently leave
+        # the earlier one behind - and RUNNER_TEMP is not always cleaned
+        # between runs on self-hosted runners.
+        scratch_dir=""
+        gradle_scratch=""
+        cleanup_scratch() {
+          [ -z "${scratch_dir}" ] || rm -rf -- "${scratch_dir}"
+          [ -z "${gradle_scratch}" ] || rm -rf -- "${gradle_scratch}"
+        }
+        trap cleanup_scratch EXIT
+
         if [ "${SBOM_FORMAT}" = "xml" ]; then
           scratch_dir="$(mktemp -d "${RUNNER_TEMP}/sbom.XXXXXX")"
-          # Remove the scratch directory on step exit: RUNNER_TEMP is
-          # not always cleaned between runs on self-hosted runners
-          trap 'rm -rf -- "${scratch_dir}"' EXIT
           json_path="${scratch_dir}/${FILENAME_PREFIX}.json"
         fi
 
@@ -997,65 +1079,61 @@ runs:
                   gradle_cmd="gradle"
                 fi
 
-                # The plugin declares a Gradle floor. Below it the task
-                # names differ and the CycloneDX schema this action asks
-                # for may not exist, so generation cannot produce a
-                # document worth scanning.
-                #
-                # A caller that already knows the version says so, which
-                # settles this before anything is downloaded;
-                # build-metadata-action reports it as
-                # java_gradle_version. Otherwise ask the tool, which is
-                # authoritative but pays for the distribution first.
+                # A supplied version settled the floor during validation,
+                # before the toolchain was provisioned. Only the
+                # ask-the-tool path is left, and it necessarily pays for
+                # the distribution first.
                 gradle_actual="${GRADLE_VERSION}"
                 if [ -z "${gradle_actual}" ]; then
                   gradle_actual="$( (cd "${PROJECT_DIR}" && \
                     ${gradle_cmd} --version 2>/dev/null) | \
                     awk '/^Gradle /{print $2; exit}')"
-                fi
 
-                gradle_minimum="8.4"
-                gradle_too_old="false"
-                if [ -n "${gradle_actual}" ]; then
-                  oldest="$(printf '%s\n%s\n' "${gradle_actual}" \
-                    "${gradle_minimum}" | sort -V | head -1)"
-                  if [ "${oldest}" != "${gradle_minimum}" ]; then
-                    gradle_too_old="true"
+                  gradle_minimum="8.4"
+                  gradle_too_old="false"
+                  if [ -n "${gradle_actual}" ]; then
+                    oldest="$(printf '%s\n%s\n' "${gradle_actual}" \
+                      "${gradle_minimum}" | sort -V | head -1)"
+                    if [ "${oldest}" != "${gradle_minimum}" ]; then
+                      gradle_too_old="true"
+                    fi
                   fi
-                fi
 
-                # Skip rather than fail. An SBOM audit is not essential
-                # to a build, other auditing tools exist, and failing a
-                # pipeline over a plugin's declared dependency would
-                # punish a project for something unrelated to its code.
-                # Skipping states the reason and leaves the project free
-                # to raise its Gradle version to get results.
-                if [ "${gradle_too_old}" = "true" ]; then
-                  echo "::warning::SBOM generation skipped: Gradle" \
-                    "${gradle_actual} is older than ${gradle_minimum}," \
-                    "which cyclonedx-gradle-plugin" \
-                    "${GRADLE_PLUGIN_VERSION} requires"
-                  {
-                    echo "## 📋 SBOM Generation Results"
-                    echo ""
-                    echo "SBOM generation skipped ⏭️"
-                    echo ""
-                    echo "This project builds with Gradle"
-                    echo "\`${gradle_actual}\`, and"
-                    echo "\`cyclonedx-gradle-plugin\`"
-                    echo "\`${GRADLE_PLUGIN_VERSION}\` requires"
-                    echo "\`${gradle_minimum}\` or newer."
-                    echo ""
-                    echo "No document was written and no counts are"
-                    echo "reported: a partial or lower-fidelity SBOM"
-                    echo "would read as a clean result."
-                    echo ""
-                    echo "Raising the Gradle version in"
-                    echo "\`gradle/wrapper/gradle-wrapper.properties\`"
-                    echo "enables the scan."
-                  } >> "$GITHUB_STEP_SUMMARY"
-                  echo "skipped=true" >> "$GITHUB_OUTPUT"
-                  exit 0
+                  # Skip rather than fail. An SBOM audit is not
+                  # essential to a build, other auditing tools exist,
+                  # and failing a pipeline over a plugin's declared
+                  # dependency would punish a project for something
+                  # unrelated to its code. Skipping states the reason
+                  # and leaves the project free to raise its Gradle
+                  # version to get results.
+                  if [ "${gradle_too_old}" = "true" ]; then
+                    echo "::warning::SBOM generation skipped: Gradle" \
+                      "${gradle_actual} is older than" \
+                      "${gradle_minimum}, which" \
+                      "cyclonedx-gradle-plugin" \
+                      "${GRADLE_PLUGIN_VERSION} requires"
+                    {
+                      echo "## 📋 SBOM Generation Results"
+                      echo ""
+                      echo "SBOM generation skipped ⏭️"
+                      echo ""
+                      echo "This project builds with Gradle"
+                      echo "\`${gradle_actual}\`, and"
+                      echo "\`cyclonedx-gradle-plugin\`"
+                      echo "\`${GRADLE_PLUGIN_VERSION}\` requires"
+                      echo "\`${gradle_minimum}\` or newer."
+                      echo ""
+                      echo "No document was written and no counts are"
+                      echo "reported: a partial or lower-fidelity SBOM"
+                      echo "would read as a clean result."
+                      echo ""
+                      echo "Raising the Gradle version in"
+                      echo "\`gradle/wrapper/gradle-wrapper.properties\`"
+                      echo "enables the scan."
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    echo "skipped=true" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
                 fi
 
                 # Both destinations are named explicitly, including the
@@ -1065,7 +1143,6 @@ runs:
                 # collect and which outlives this step.
                 gradle_scratch="$(mktemp -d \
                   "${RUNNER_TEMP}/sbom-gradle.XXXXXX")"
-                trap 'rm -rf -- "${gradle_scratch}"' EXIT
                 if [ "${SBOM_FORMAT}" = "json" ]; then
                   gradle_xml_out="${gradle_scratch}/${FILENAME_PREFIX}.xml"
                 else
@@ -1141,7 +1218,8 @@ runs:
                   echo "    tasks.named('cyclonedxDirectBom') {"
                   echo "      includeConfigs = configs"
                   echo "      schemaVersion = schema"
-                  echo "      def s = project.path.replace(':', '_')"
+                  echo "      def s = project.path"
+                  echo "        .replace('_', '__').replace(':', '_')"
                   echo "      def d = { e -> new File(scratch, s + e) }"
                   echo "      jsonOutput.fileValue(d('.json'))"
                   echo "      xmlOutput.fileValue(d('.xml'))"
@@ -1188,14 +1266,15 @@ runs:
                         -p|-p=*|--project-dir|--project-dir=*|\
                         -c|-c=*|--settings-file|--settings-file=*|\
                         -b|-b=*|--build-file|--build-file=*|\
-                        -I|-I=*|--init-script|--init-script=*)
+                        -I|-I=*|--init-script|--init-script=*|\
+                        --include-build|--include-build=*)
                           echo "Error: gradle_args may not select an" \
                             "alternate project ❌"
-                          echo "Project, settings, build-file and"
-                          echo "init-script selection would escape the"
-                          echo "validated project directory. Use"
-                          echo "path_prefix to choose which project to"
-                          echo "scan."
+                          echo "Project, settings, build-file,"
+                          echo "init-script and composite-build"
+                          echo "selection would escape the validated"
+                          echo "project directory. Use path_prefix to"
+                          echo "choose which project to scan."
                           exit 1 ;;
                       esac
                     fi
