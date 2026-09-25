@@ -61,7 +61,7 @@ inputs:
     default: "."
   include_dev:
     # yamllint disable-line rule:line-length
-    description: "Include development dependencies (Maven: test scope) in SBOM"
+    description: "Include development dependencies (Maven test scope, Gradle test configurations) in SBOM"
     required: false
     default: "false"
   fail_on_error:
@@ -98,6 +98,26 @@ inputs:
     description: "Is the checkout untrusted: 'auto', 'true' or 'false'"
     required: false
     default: "auto"
+  dependency_manager:
+    # yamllint disable-line rule:line-length
+    description: "Build tool for the cyclonedx backend: 'auto', 'maven' or 'gradle'"
+    required: false
+    default: "auto"
+  gradle_plugin_version:
+    # yamllint disable-line rule:line-length
+    description: "cyclonedx-gradle-plugin version; 3.0.0 or newer"
+    required: false
+    default: "3.4.1"
+  gradle_version:
+    # yamllint disable-line rule:line-length
+    description: "Gradle version the project uses; empty asks the build tool"
+    required: false
+    default: ""
+  gradle_args:
+    # yamllint disable-line rule:line-length
+    description: "Extra arguments appended to the Gradle call, split on whitespace"
+    required: false
+    default: ""
 
 outputs:
   sbom_json_path:
@@ -119,7 +139,13 @@ outputs:
   skipped:
     # yamllint disable-line rule:line-length
     description: "True when generation was skipped; no SBOM exists and counts are empty"
-    value: ${{ steps.validate.outputs.skipped }}
+    # Generation reports this where it can, because a Gradle version
+    # below the plugin's floor only emerges once the action can ask the
+    # build tool. Validation's decision is the fallback: it also covers
+    # the runs where generation never reported one, such as a validation
+    # failure that stops the step from running at all.
+    # yamllint disable-line rule:line-length
+    value: ${{ steps.generate.outputs.skipped || steps.validate.outputs.skipped }}
 
 runs:
   using: "composite"
@@ -138,6 +164,9 @@ runs:
         INPUT_JAVA_VERSION: ${{ inputs.java_version }}
         INPUT_JAVA_DISTRIBUTION: ${{ inputs.java_distribution }}
         INPUT_MAVEN_PLUGIN_VERSION: ${{ inputs.maven_plugin_version }}
+        INPUT_GRADLE_PLUGIN_VERSION: ${{ inputs.gradle_plugin_version }}
+        INPUT_GRADLE_VERSION: ${{ inputs.gradle_version }}
+        INPUT_DEPENDENCY_MANAGER: ${{ inputs.dependency_manager }}
         INPUT_UNTRUSTED_CHECKOUT: ${{ inputs.untrusted_checkout }}
         # Empty for every event that is not a pull request. Compared
         # against GITHUB_REPOSITORY (a default runner variable) to test
@@ -270,6 +299,55 @@ runs:
             echo "Expected a setup-java distribution such as temurin"
             exit 1 ;;
         esac
+        # Same treatment for the Gradle plugin coordinate, which reaches
+        # an init script this action writes.
+        case "${INPUT_GRADLE_PLUGIN_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid gradle_plugin_version ❌"
+            echo "Expected a version such as 3.4.1"
+            exit 1 ;;
+        esac
+        # cyclonedx-gradle-plugin 3.x registers cyclonedxBom on the
+        # project the plugin is applied to and aggregates its
+        # subprojects. Earlier lines register different task names and
+        # cap the CycloneDX schema at 1.6 or lower, so the schema this
+        # action asks for may not exist there. Verified against the
+        # plugin's own compatibility table.
+        gradle_plugin_minimum="3.0.0"
+        oldest="$(printf '%s\n%s\n' "${INPUT_GRADLE_PLUGIN_VERSION}" \
+          "${gradle_plugin_minimum}" | sort -V | head -1)"
+        if [ "${oldest}" != "${gradle_plugin_minimum}" ]; then
+          echo "Error: gradle_plugin_version is too old ❌"
+          echo "Minimum supported: ${gradle_plugin_minimum}"
+          echo "Earlier releases register different task names and cap"
+          echo "the CycloneDX schema below what this action requests"
+          exit 1
+        fi
+        # Empty means "ask the build tool". Anything else is compared
+        # against the plugin's floor, so it has to be a version: a bare
+        # word such as 'latest' would sort against 8.4 and be treated as
+        # supported, turning the check into a coin toss.
+        case "${INPUT_GRADLE_VERSION}" in
+          '') ;;
+          [0-9]*)
+            case "${INPUT_GRADLE_VERSION}" in
+              *[!0-9A-Za-z.-]*|*..*|*.)
+                echo "Error: invalid gradle_version ❌"
+                echo "Expected a Gradle version such as 8.14.2"
+                exit 1 ;;
+            esac ;;
+          *)
+            echo "Error: invalid gradle_version ❌"
+            echo "Expected a Gradle version such as 8.14.2"
+            exit 1 ;;
+        esac
+        case "${INPUT_DEPENDENCY_MANAGER}" in
+          auto|maven|gradle) ;;
+          *)
+            echo "Error: dependency_manager must be 'auto', 'maven'" \
+              "or 'gradle' ❌"
+            exit 1 ;;
+        esac
         # Anchor relative paths to GITHUB_WORKSPACE: composite
         # actions can run with a caller-set working directory, so
         # resolving against the current directory would be
@@ -368,38 +446,150 @@ runs:
           [ "${untrusted}" = "true" ]; then
           skipped="true"
         fi
+
+        skip_reason=""
+        if [ "${skipped}" = "true" ]; then
+          skip_reason="untrusted"
+        fi
+        # Recorded before the build-tool resolution below, which can
+        # exit non-zero on a project this backend cannot drive. Waiting
+        # until after it would leave the output empty on that path, and
+        # a caller reading skipped would get nothing rather than the
+        # trust decision that was already made. The later write updates
+        # it where the Gradle floor changes the answer.
         echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+        echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
 
         # Resolve which build tool the cyclonedx backend will drive.
         # The backend names the tool producing the document, not the
-        # build system, so the build system is detected here and
-        # reported through the dependency_manager output - the caller
-        # would otherwise have no way to tell which plugin ran.
-        # Detecting before the JDK download also means an unsupported
-        # project fails fast rather than after a toolchain install.
+        # build system, so the build system is reported through the
+        # dependency_manager output - the caller would otherwise have no
+        # way to tell which plugin ran. Resolving before the JDK download
+        # also means an unsupported project fails fast rather than after
+        # a toolchain install.
+        #
+        # A caller that already knows should say so. Detection reads the
+        # files present, which is a guess about intent: a repository may
+        # carry both a pom.xml and a Gradle script, and a workflow
+        # dedicated to one build tool has better information than any
+        # inspection of the tree. build-metadata-action reports exactly
+        # this as build_tool, so a lane can pass it straight through.
         dependency_manager=""
         if [ "${INPUT_BACKEND}" = "cyclonedx" ] && \
           [ "${skipped}" != "true" ]; then
-          if [ -f "${resolved}/pom.xml" ]; then
+          if [ "${INPUT_DEPENDENCY_MANAGER}" != "auto" ]; then
+            dependency_manager="${INPUT_DEPENDENCY_MANAGER}"
+            echo "Caller supplied build tool: ${dependency_manager}"
+          elif [ -f "${resolved}/pom.xml" ]; then
             dependency_manager="maven"
+            echo "Detected build tool: ${dependency_manager}"
           elif [ -f "${resolved}/build.gradle" ] || \
             [ -f "${resolved}/build.gradle.kts" ] || \
             [ -f "${resolved}/settings.gradle" ] || \
             [ -f "${resolved}/settings.gradle.kts" ]; then
-            echo "Error: Gradle is not yet supported ❌"
-            echo "The cyclonedx backend currently drives Maven only;"
-            echo "Gradle support is tracked upstream. Use the syft"
-            echo "backend for Gradle projects in the meantime."
-            exit 1
+            dependency_manager="gradle"
+            echo "Detected build tool: ${dependency_manager}"
           else
             echo "Error: no Maven or Gradle project found ❌"
             echo "The cyclonedx backend needs a pom.xml or a Gradle"
             echo "build script in the project directory"
             exit 1
           fi
-          echo "Detected build tool: ${dependency_manager}"
+
+          # A supplied value still has to describe the checkout, or the
+          # backend would drive a tool this project does not use and
+          # report a confusing failure from deep inside it.
+          case "${dependency_manager}" in
+            maven)
+              if [ ! -f "${resolved}/pom.xml" ]; then
+                echo "Error: no pom.xml in the project directory ❌"
+                echo "dependency_manager is 'maven' but the checkout"
+                echo "carries no Maven build"
+                exit 1
+              fi ;;
+            gradle)
+              if [ ! -f "${resolved}/build.gradle" ] && \
+                [ ! -f "${resolved}/build.gradle.kts" ] && \
+                [ ! -f "${resolved}/settings.gradle" ] && \
+                [ ! -f "${resolved}/settings.gradle.kts" ]; then
+                echo "Error: no Gradle build script found ❌"
+                echo "dependency_manager is 'gradle' but the checkout"
+                echo "carries no Gradle build"
+                exit 1
+              fi ;;
+          esac
         fi
         echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
+
+        # Now that the build tool is known, a supplied Gradle version
+        # settles the plugin's floor here, before the JDK download
+        # rather than after it. Deciding in generate would provision a
+        # toolchain for a run already known to produce nothing. Where no
+        # version was supplied the decision waits until generate can ask
+        # the build tool.
+        #
+        # Gated on the resolved tool: a gradle_version left set while
+        # scanning a Maven project must not skip that project.
+        #
+        # Skipping rather than failing for the same reason as above: an
+        # SBOM audit is not essential to a build, and failing a pipeline
+        # over a plugin's declared dependency would punish a project for
+        # something unrelated to its own code.
+        # The effective floor is the later of two requirements, not just
+        # the plugin's. Gradle also has to run on the JDK this action
+        # installs, and Gradle's Java compatibility moved with each
+        # release: on the default java_version of 21, Gradle only became
+        # supported at 8.5, so a declared 8.4 would clear the plugin's
+        # requirement and then fail inside Gradle on an unsupported JVM
+        # - the confusing failure the skip exists to replace.
+        #
+        # A JDK this table does not name leaves the plugin floor
+        # standing alone. Inventing a requirement for a release whose
+        # compatibility is unknown would be a guess, and Gradle reports
+        # an unsupported JVM clearly enough on its own.
+        plugin_minimum="8.4"
+        # Reduced to the major before the lookup, since java_version
+        # accepts a full version: setup-java takes '21.0.5' as readily
+        # as '21', and matching the whole string would miss the table
+        # and silently leave the plugin floor standing alone.
+        java_major="${INPUT_JAVA_VERSION%%.*}"
+        case "${java_major}" in
+          17) java_minimum="7.3" ;;
+          18) java_minimum="7.5" ;;
+          19) java_minimum="7.6" ;;
+          20) java_minimum="8.1" ;;
+          21) java_minimum="8.5" ;;
+          22) java_minimum="8.8" ;;
+          23) java_minimum="8.10" ;;
+          24) java_minimum="8.14" ;;
+          25) java_minimum="9.1" ;;
+          *) java_minimum="" ;;
+        esac
+        gradle_minimum="${plugin_minimum}"
+        if [ -n "${java_minimum}" ]; then
+          gradle_minimum="$(printf '%s\n%s\n' "${plugin_minimum}" \
+            "${java_minimum}" | sort -V | tail -1)"
+        fi
+
+        if [ "${dependency_manager}" = "gradle" ] && \
+          [ -n "${INPUT_GRADLE_VERSION}" ]; then
+          oldest="$(printf '%s\n%s\n' "${INPUT_GRADLE_VERSION}" \
+            "${gradle_minimum}" | sort -V | head -1)"
+          if [ "${oldest}" != "${gradle_minimum}" ]; then
+            echo "::warning::SBOM generation skipped: Gradle" \
+              "${INPUT_GRADLE_VERSION} is older than" \
+              "${gradle_minimum}, required by" \
+              "cyclonedx-gradle-plugin" \
+              "${INPUT_GRADLE_PLUGIN_VERSION} on JDK" \
+              "${INPUT_JAVA_VERSION}"
+            skipped="true"
+            skip_reason="gradle-too-old"
+          fi
+        fi
+        echo "skipped=${skipped}" >> "$GITHUB_OUTPUT"
+        echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+        echo "gradle_version=${INPUT_GRADLE_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "gradle_minimum=${gradle_minimum}" >> "$GITHUB_OUTPUT"
 
     - name: "Download syft"
       id: syft
@@ -445,6 +635,7 @@ runs:
         BACKEND: ${{ inputs.backend }}
         DEPENDENCY_MANAGER: ${{ steps.validate.outputs.dependency_manager }}
         SKIPPED: ${{ steps.validate.outputs.skipped }}
+        SKIP_REASON: ${{ steps.validate.outputs.skip_reason }}
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}
         PROJECT_DIR: ${{ inputs.path_prefix }}
         SBOM_FORMAT: ${{ inputs.sbom_format }}
@@ -468,6 +659,17 @@ runs:
         # array, the reserved name would apply every caller argument
         # twice, running a positional goal coordinate twice over.
         INPUT_MAVEN_ARGS: ${{ inputs.maven_args }}
+        GRADLE_PLUGIN_VERSION: ${{ inputs.gradle_plugin_version }}
+        GRADLE_VERSION: ${{ inputs.gradle_version }}
+        # yamllint disable-line rule:line-length
+        GRADLE_MINIMUM: ${{ steps.validate.outputs.gradle_minimum }}
+        JAVA_VERSION: ${{ inputs.java_version }}
+        # Shadowed for the same reason as MAVEN_ARGS. Gradle reads
+        # GRADLE_OPTS and JAVA_OPTS from the environment rather than a
+        # GRADLE_ARGS name, so the collision is weaker here, but the
+        # caller value still travels under its own name and is spliced
+        # into the argument array after validation.
+        INPUT_GRADLE_ARGS: ${{ inputs.gradle_args }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
         # exposes them
@@ -642,6 +844,32 @@ runs:
         # sbom-cyclonedx.json would otherwise survive the skip and be
         # published by the caller's artifact glob.
         if [ "${SKIPPED}" = "true" ]; then
+          if [ "${SKIP_REASON}" = "gradle-too-old" ]; then
+            # Validation reported this one already, before the toolchain
+            # was provisioned, so only the summary is left to write.
+            {
+              echo "## 📋 SBOM Generation Results"
+              echo ""
+              echo "SBOM generation skipped ⏭️"
+              echo ""
+              echo "This project builds with Gradle"
+              echo "\`${GRADLE_VERSION}\`, and"
+              echo "\`cyclonedx-gradle-plugin\`"
+              echo "\`${GRADLE_PLUGIN_VERSION}\` on JDK"
+              echo "\`${JAVA_VERSION}\` requires"
+              echo "\`${GRADLE_MINIMUM}\` or newer."
+              echo ""
+              echo "No document was written and no counts are"
+              echo "reported: a partial or lower-fidelity SBOM would"
+              echo "read as a clean result."
+              echo ""
+              echo "Raising the Gradle version in"
+              echo "\`gradle/wrapper/gradle-wrapper.properties\`"
+              echo "enables the scan."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "::warning::SBOM generation skipped: the ${BACKEND}" \
             "backend executes code from the checkout, which is not" \
             "trusted here"
@@ -662,6 +890,7 @@ runs:
             echo "Set \`untrusted_checkout: 'false'\` where the"
             echo "checkout is known to be trusted."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -672,11 +901,21 @@ runs:
         # outputs: downstream consumers (such as a Grype audit job)
         # can only rely on the JSON document when the caller requests
         # the json or both formats
+        # One trap for every scratch directory this step may create.
+        # A second 'trap ... EXIT' REPLACES the first rather than adding
+        # to it, so installing one per directory would silently leave
+        # the earlier one behind - and RUNNER_TEMP is not always cleaned
+        # between runs on self-hosted runners.
+        scratch_dir=""
+        gradle_scratch=""
+        cleanup_scratch() {
+          [ -z "${scratch_dir}" ] || rm -rf -- "${scratch_dir}"
+          [ -z "${gradle_scratch}" ] || rm -rf -- "${gradle_scratch}"
+        }
+        trap cleanup_scratch EXIT
+
         if [ "${SBOM_FORMAT}" = "xml" ]; then
           scratch_dir="$(mktemp -d "${RUNNER_TEMP}/sbom.XXXXXX")"
-          # Remove the scratch directory on step exit: RUNNER_TEMP is
-          # not always cleaned between runs on self-hosted runners
-          trap 'rm -rf -- "${scratch_dir}"' EXIT
           json_path="${scratch_dir}/${FILENAME_PREFIX}.json"
         fi
 
@@ -696,171 +935,496 @@ runs:
             set -e
             ;;
           cyclonedx)
-            # Only maven reaches here: validate rejects Gradle and
-            # anything unrecognised, so DEPENDENCY_MANAGER is 'maven'.
-            # A Gradle branch joins this case rather than becoming a
-            # separate backend.
-            # makeAggregateBom writes every requested format into one
-            # directory and cannot split them, so an xml-only run
-            # generates both into the scratch directory and moves the
-            # XML into place afterwards. Writing JSON into the output
-            # directory instead would leave a document the caller did
-            # not ask for, which the artifact globs would then collect
-            if [ "${SBOM_FORMAT}" = "xml" ]; then
-              gen_dir="${scratch_dir}"
-              output_format="all"
-            elif [ "${SBOM_FORMAT}" = "json" ]; then
-              gen_dir="${OUTPUT_DIR}"
-              output_format="json"
-            else
-              gen_dir="${OUTPUT_DIR}"
-              output_format="all"
-            fi
-            # Direct goal invocation, so the consumer's pom.xml needs
-            # no plugin entry and the build leaves no target/
-            # directories behind. The action does write its report
-            # files, which land in the checkout whenever
-            # output_directory points there; what stays untouched is
-            # the project itself.
-            # makeAggregateBom (not makeBom) runs once at the reactor
-            # root and covers every module, which is what multi-module
-            # projects need.
-            #
-            # includeTestScope maps onto include_dev: Maven's test
-            # scope is the analogue of npm devDependencies, absent
-            # from every deployment and excluded by default. The
-            # plugin's other scope defaults (compile, runtime,
-            # provided, system all true) are left alone, so the BOM
-            # describes what the application depends on at RUNTIME
-            # rather than only what the build packages. provided and
-            # system artefacts are absent from the JAR yet present
-            # when the application runs, so a vulnerability in one is
-            # real; neither property is reserved, and a caller wanting
-            # a packaging-only BOM can disable them via maven_args.
-            #
-            # skipAttach stops the BOM being attached as a build
-            # artifact: this action generates a report, it does not
-            # participate in the project's own build lifecycle.
-            maven_goal="org.cyclonedx:cyclonedx-maven-plugin"
-            maven_goal="${maven_goal}:${MAVEN_PLUGIN_VERSION}"
-            maven_goal="${maven_goal}:makeAggregateBom"
-            set -- "${maven_goal}" -B --no-transfer-progress
-            # Split maven_args on whitespace without running it through
-            # a shell: 'set -f' suppresses pathname expansion for the
-            # duration, so an argument containing * cannot glob against
-            # the runner filesystem, and no eval is involved.
-            #
-            # Caller arguments go BEFORE the action-owned properties
-            # below. Maven resolves a repeated -D to its last
-            # occurrence, so this ordering makes the action's values
-            # authoritative: a caller cannot redirect outputDirectory
-            # outside the validated output directory, nor change the
-            # filename, format, spec version or test scoping that the
-            # outputs, component count and artifact contract depend on.
-            # The explicit rejection below turns a silently ignored
-            # override into a clear error; the ordering is what makes
-            # it safe regardless.
-            if [ -n "${INPUT_MAVEN_ARGS}" ]; then
-              set -f
-              # shellcheck disable=SC2086
-              set -- "$@" ${INPUT_MAVEN_ARGS}
-              set +f
-              # Maven spells a system property four ways: -Dname,
-              # -D name, --define name and --define=name. Matching
-              # only the compact -D form let '--define cyclonedx.skip'
-              # through, so each argument is normalised to a bare
-              # name=value before the name is compared.
-              expect_value="no"
-              for arg in "$@"; do
-                candidate=""
-                if [ "${expect_value}" = "yes" ]; then
-                  candidate="${arg}"
-                  expect_value="no"
+            # Both build tools reach here. The backend names the
+            # tool producing the document rather than the build
+            # system, so this dispatches on what validate resolved.
+            case "${DEPENDENCY_MANAGER}" in
+              maven)
+                # Only maven reaches here: validate rejects Gradle and
+                # anything unrecognised, so DEPENDENCY_MANAGER is 'maven'.
+                # A Gradle branch joins this case rather than becoming a
+                # separate backend.
+                # makeAggregateBom writes every requested format into one
+                # directory and cannot split them, so an xml-only run
+                # generates both into the scratch directory and moves the
+                # XML into place afterwards. Writing JSON into the output
+                # directory instead would leave a document the caller did
+                # not ask for, which the artifact globs would then collect
+                if [ "${SBOM_FORMAT}" = "xml" ]; then
+                  gen_dir="${scratch_dir}"
+                  output_format="all"
+                elif [ "${SBOM_FORMAT}" = "json" ]; then
+                  gen_dir="${OUTPUT_DIR}"
+                  output_format="json"
                 else
-                  case "${arg}" in
-                    -D|--define)
-                      expect_value="yes"
-                      continue ;;
-                    --define=*) candidate="${arg#--define=}" ;;
-                    -D*) candidate="${arg#-D}" ;;
-                    # Maven's -f/--file selects an alternate POM or
-                    # project directory, which would resolve and
-                    # execute a project outside the PROJECT_DIR this
-                    # action validated against the workspace, and
-                    # describe it in an SBOM labelled with
-                    # path_prefix. Rejected in every spelling; use
-                    # path_prefix to choose the project.
-                    -f|-f=*|-f?*|--file|--file=*)
-                      echo "Error: maven_args may not select an" \
-                        "alternate project ❌"
-                      echo "-f/--file would escape the validated"
-                      echo "project directory. Use path_prefix to"
-                      echo "choose which project to scan."
-                      exit 1 ;;
-                  esac
+                  gen_dir="${OUTPUT_DIR}"
+                  output_format="all"
                 fi
-                [ -n "${candidate}" ] || continue
-                case "${candidate%%=*}" in
-                  outputFormat|outputName|outputDirectory|\
-                  schemaVersion|includeTestScope|\
-                  cyclonedx.skip|cyclonedx.skipAttach)
-                    echo "Error: maven_args overrides a protected" \
-                      "property ❌"
-                    echo "Set these through the action's own inputs:"
-                    echo "  outputFormat     -> sbom_format"
-                    echo "  outputName       -> filename_prefix"
-                    echo "  outputDirectory  -> output_directory"
-                    echo "  schemaVersion    -> sbom_spec_version"
-                    echo "  includeTestScope -> include_dev"
-                    echo "cyclonedx.skip and cyclonedx.skipAttach are" \
-                      "reserved: skipping would defeat the action."
-                    exit 1 ;;
-                esac
-              done
-            fi
-            # Action-owned properties last, so they win.
-            #
-            # skipAttach and skip take the plugin's qualified user
-            # property names. The unqualified forms are the parameter
-            # names, which Maven does NOT bind from the command line:
-            # -DskipAttach=true is silently ignored, leaving the BOM
-            # attached to the project. Verified with help:describe.
-            set -- "$@" \
-              -DoutputFormat="${output_format}" \
-              -DoutputName="${FILENAME_PREFIX}" \
-              -DoutputDirectory="${gen_dir}" \
-              -DschemaVersion="${SPEC_VERSION}" \
-              -DincludeTestScope="${INCLUDE_DEV}" \
-              -Dcyclonedx.skipAttach=true
+                # Direct goal invocation, so the consumer's pom.xml needs
+                # no plugin entry and the build leaves no target/
+                # directories behind. The action does write its report
+                # files, which land in the checkout whenever
+                # output_directory points there; what stays untouched is
+                # the project itself.
+                # makeAggregateBom (not makeBom) runs once at the reactor
+                # root and covers every module, which is what multi-module
+                # projects need.
+                #
+                # includeTestScope maps onto include_dev: Maven's test
+                # scope is the analogue of npm devDependencies, absent
+                # from every deployment and excluded by default. The
+                # plugin's other scope defaults (compile, runtime,
+                # provided, system all true) are left alone, so the BOM
+                # describes what the application depends on at RUNTIME
+                # rather than only what the build packages. provided and
+                # system artefacts are absent from the JAR yet present
+                # when the application runs, so a vulnerability in one is
+                # real; neither property is reserved, and a caller wanting
+                # a packaging-only BOM can disable them via maven_args.
+                #
+                # skipAttach stops the BOM being attached as a build
+                # artifact: this action generates a report, it does not
+                # participate in the project's own build lifecycle.
+                maven_goal="org.cyclonedx:cyclonedx-maven-plugin"
+                maven_goal="${maven_goal}:${MAVEN_PLUGIN_VERSION}"
+                maven_goal="${maven_goal}:makeAggregateBom"
+                set -- "${maven_goal}" -B --no-transfer-progress
+                # Split maven_args on whitespace without running it through
+                # a shell: 'set -f' suppresses pathname expansion for the
+                # duration, so an argument containing * cannot glob against
+                # the runner filesystem, and no eval is involved.
+                #
+                # Caller arguments go BEFORE the action-owned properties
+                # below. Maven resolves a repeated -D to its last
+                # occurrence, so this ordering makes the action's values
+                # authoritative: a caller cannot redirect outputDirectory
+                # outside the validated output directory, nor change the
+                # filename, format, spec version or test scoping that the
+                # outputs, component count and artifact contract depend on.
+                # The explicit rejection below turns a silently ignored
+                # override into a clear error; the ordering is what makes
+                # it safe regardless.
+                if [ -n "${INPUT_MAVEN_ARGS}" ]; then
+                  set -f
+                  # shellcheck disable=SC2086
+                  set -- "$@" ${INPUT_MAVEN_ARGS}
+                  set +f
+                  # Maven spells a system property four ways: -Dname,
+                  # -D name, --define name and --define=name. Matching
+                  # only the compact -D form let '--define cyclonedx.skip'
+                  # through, so each argument is normalised to a bare
+                  # name=value before the name is compared.
+                  expect_value="no"
+                  for arg in "$@"; do
+                    candidate=""
+                    if [ "${expect_value}" = "yes" ]; then
+                      candidate="${arg}"
+                      expect_value="no"
+                    else
+                      case "${arg}" in
+                        -D|--define)
+                          expect_value="yes"
+                          continue ;;
+                        --define=*) candidate="${arg#--define=}" ;;
+                        -D*) candidate="${arg#-D}" ;;
+                        # Maven's -f/--file selects an alternate POM or
+                        # project directory, which would resolve and
+                        # execute a project outside the PROJECT_DIR this
+                        # action validated against the workspace, and
+                        # describe it in an SBOM labelled with
+                        # path_prefix. Rejected in every spelling; use
+                        # path_prefix to choose the project.
+                        -f|-f=*|-f?*|--file|--file=*)
+                          echo "Error: maven_args may not select an" \
+                            "alternate project ❌"
+                          echo "-f/--file would escape the validated"
+                          echo "project directory. Use path_prefix to"
+                          echo "choose which project to scan."
+                          exit 1 ;;
+                      esac
+                    fi
+                    [ -n "${candidate}" ] || continue
+                    case "${candidate%%=*}" in
+                      outputFormat|outputName|outputDirectory|\
+                      schemaVersion|includeTestScope|\
+                      cyclonedx.skip|cyclonedx.skipAttach)
+                        echo "Error: maven_args overrides a protected" \
+                          "property ❌"
+                        echo "Set these through the action's own inputs:"
+                        echo "  outputFormat     -> sbom_format"
+                        echo "  outputName       -> filename_prefix"
+                        echo "  outputDirectory  -> output_directory"
+                        echo "  schemaVersion    -> sbom_spec_version"
+                        echo "  includeTestScope -> include_dev"
+                        echo "cyclonedx.skip and cyclonedx.skipAttach are" \
+                          "reserved: skipping would defeat the action."
+                        exit 1 ;;
+                    esac
+                  done
+                fi
+                # Action-owned properties last, so they win.
+                #
+                # skipAttach and skip take the plugin's qualified user
+                # property names. The unqualified forms are the parameter
+                # names, which Maven does NOT bind from the command line:
+                # -DskipAttach=true is silently ignored, leaving the BOM
+                # attached to the project. Verified with help:describe.
+                set -- "$@" \
+                  -DoutputFormat="${output_format}" \
+                  -DoutputName="${FILENAME_PREFIX}" \
+                  -DoutputDirectory="${gen_dir}" \
+                  -DschemaVersion="${SPEC_VERSION}" \
+                  -DincludeTestScope="${INCLUDE_DEV}" \
+                  -Dcyclonedx.skipAttach=true
 
-            echo "Generating SBOM with cyclonedx-maven-plugin" \
-              "${MAVEN_PLUGIN_VERSION} (test scope: ${INCLUDE_DEV})"
-            # Running the build tool against the checkout makes the
-            # project EXECUTABLE INPUT, not merely metadata to be read.
-            # Maven loads .mvn/extensions.xml and POM build extensions
-            # as JVM code before this goal runs, and .mvn/maven.config
-            # contributes command-line arguments. None of that can be
-            # disabled from the command line, and it happens even
-            # though the goal itself never compiles anything.
-            #
-            # The cyclonedx backend therefore requires a TRUSTED
-            # checkout. This is a genuine difference from the syft
-            # backend, which only reads files, and it is documented in
-            # the README under 'Trust Boundary'.
-            set +e
-            (cd "${PROJECT_DIR}" && mvn "$@")
-            backend_exit=$?
-            set -e
+                echo "Generating SBOM with cyclonedx-maven-plugin" \
+                  "${MAVEN_PLUGIN_VERSION} (test scope: ${INCLUDE_DEV})"
+                # Running the build tool against the checkout makes the
+                # project EXECUTABLE INPUT, not merely metadata to be read.
+                # Maven loads .mvn/extensions.xml and POM build extensions
+                # as JVM code before this goal runs, and .mvn/maven.config
+                # contributes command-line arguments. None of that can be
+                # disabled from the command line, and it happens even
+                # though the goal itself never compiles anything.
+                #
+                # The cyclonedx backend therefore requires a TRUSTED
+                # checkout. This is a genuine difference from the syft
+                # backend, which only reads files, and it is documented in
+                # the README under 'Trust Boundary'.
+                set +e
+                (cd "${PROJECT_DIR}" && mvn "$@")
+                backend_exit=$?
+                set -e
 
-            # Guarded on the file existing: a zero exit does not imply
-            # output was written, and an unguarded mv would abort the
-            # step under 'set -e' before the checks below can route the
-            # failure through fail_on_error
-            if [ "${backend_exit}" = "0" ] && \
-              [ "${SBOM_FORMAT}" = "xml" ] && \
-              [ -f "${scratch_dir}/${FILENAME_PREFIX}.xml" ]; then
-              mv -- "${scratch_dir}/${FILENAME_PREFIX}.xml" "${xml_path}"
-            fi
+                # Guarded on the file existing: a zero exit does not imply
+                # output was written, and an unguarded mv would abort the
+                # step under 'set -e' before the checks below can route the
+                # failure through fail_on_error
+                if [ "${backend_exit}" = "0" ] && \
+                  [ "${SBOM_FORMAT}" = "xml" ] && \
+                  [ -f "${scratch_dir}/${FILENAME_PREFIX}.xml" ]; then
+                  mv -- "${scratch_dir}/${FILENAME_PREFIX}.xml" "${xml_path}"
+                fi
+                ;;
+              gradle)
+                # The plugin is applied through an init script, so the
+                # consumer's build files need no entry. Unlike the Maven
+                # branch, which invokes a goal directly, Gradle still
+                # configures the build: it creates .gradle/ and build/
+                # directories in the checkout. That is inherent to
+                # running Gradle at all, and the build job does the same
+                # on the same tree, but it is a real difference from
+                # Maven and worth knowing.
+                #
+                # cyclonedxBom on the root project aggregates the Direct
+                # SBOMs of every contributing subproject, which is the
+                # Gradle counterpart of makeAggregateBom.
+                if [ -x "${PROJECT_DIR}/gradlew" ]; then
+                  # Prefer the wrapper, matching how gradle-build-action
+                  # invokes a build when no version is pinned: it runs
+                  # the version the project asks for rather than
+                  # whichever one the runner image happens to ship.
+                  gradle_cmd="./gradlew"
+                else
+                  gradle_cmd="gradle"
+                fi
+
+                # A supplied version settled the floor during validation,
+                # before the toolchain was provisioned. Only the
+                # ask-the-tool path is left, and it necessarily pays for
+                # the distribution first.
+                gradle_actual="${GRADLE_VERSION}"
+                if [ -z "${gradle_actual}" ]; then
+                  # Non-fatal: this step runs under 'set -e', so a
+                  # missing gradle, a failed wrapper download or a JVM
+                  # that will not start would exit here and bypass
+                  # fail_on_error entirely. Leaving the probe empty
+                  # lets the guarded invocation below record the real
+                  # exit status and route it through the usual handler.
+                  set +e
+                  gradle_actual="$( (cd "${PROJECT_DIR}" && \
+                    ${gradle_cmd} --version 2>/dev/null) | \
+                    awk '/^Gradle /{print $2; exit}')"
+                  set -e
+
+                  gradle_minimum="${GRADLE_MINIMUM}"
+                  gradle_too_old="false"
+                  if [ -n "${gradle_actual}" ]; then
+                    oldest="$(printf '%s\n%s\n' "${gradle_actual}" \
+                      "${gradle_minimum}" | sort -V | head -1)"
+                    if [ "${oldest}" != "${gradle_minimum}" ]; then
+                      gradle_too_old="true"
+                    fi
+                  fi
+
+                  # Skip rather than fail. An SBOM audit is not
+                  # essential to a build, other auditing tools exist,
+                  # and failing a pipeline over a plugin's declared
+                  # dependency would punish a project for something
+                  # unrelated to its code. Skipping states the reason
+                  # and leaves the project free to raise its Gradle
+                  # version to get results.
+                  if [ "${gradle_too_old}" = "true" ]; then
+                    echo "::warning::SBOM generation skipped: Gradle" \
+                      "${gradle_actual} is older than" \
+                      "${gradle_minimum}, required by" \
+                      "cyclonedx-gradle-plugin" \
+                      "${GRADLE_PLUGIN_VERSION} on JDK" \
+                      "${JAVA_VERSION}"
+                    {
+                      echo "## 📋 SBOM Generation Results"
+                      echo ""
+                      echo "SBOM generation skipped ⏭️"
+                      echo ""
+                      echo "This project builds with Gradle"
+                      echo "\`${gradle_actual}\`, and"
+                      echo "\`cyclonedx-gradle-plugin\`"
+                      echo "\`${GRADLE_PLUGIN_VERSION}\` requires"
+                      echo "\`${gradle_minimum}\` or newer."
+                      echo ""
+                      echo "No document was written and no counts are"
+                      echo "reported: a partial or lower-fidelity SBOM"
+                      echo "would read as a clean result."
+                      echo ""
+                      echo "Raising the Gradle version in"
+                      echo "\`gradle/wrapper/gradle-wrapper.properties\`"
+                      echo "enables the scan."
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    echo "skipped=true" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                fi
+
+                # Both destinations are named explicitly, including the
+                # one the caller did not ask for. Leaving either at its
+                # convention would write a report into the project's own
+                # build directory, which the artifact globs could then
+                # collect and which outlives this step.
+                gradle_scratch="$(mktemp -d \
+                  "${RUNNER_TEMP}/sbom-gradle.XXXXXX")"
+                if [ "${SBOM_FORMAT}" = "json" ]; then
+                  gradle_xml_out="${gradle_scratch}/${FILENAME_PREFIX}.xml"
+                else
+                  gradle_xml_out="${xml_path}"
+                fi
+
+                # includeConfigs names the resolvable configurations to
+                # scan. Left empty the plugin scans every one, which
+                # sweeps in tool classpaths such as jacocoAnt and the
+                # ASM it carries - build tooling absent from the shipped
+                # artefact, and noise in a vulnerability report.
+                #
+                # compileClasspath and runtimeClasspath together are the
+                # closest Gradle analogue of the Maven scopes this
+                # action keeps: what the application compiles against
+                # and what it needs at runtime.
+                #
+                # include_dev adds the test configurations, mirroring
+                # includeTestScope on the Maven side.
+                gradle_configs="compileClasspath,runtimeClasspath"
+                if [ "${INCLUDE_DEV}" = "true" ]; then
+                  gradle_configs="${gradle_configs},testCompileClasspath"
+                  gradle_configs="${gradle_configs},testRuntimeClasspath"
+                fi
+
+                # Every value reaches the script as a system property
+                # rather than being spliced into its text, so no caller
+                # input is ever interpolated into code, and paths
+                # containing spaces need no quoting rules of their own.
+                init_script="${gradle_scratch}/cyclonedx-init.gradle"
+                # The script reads every value as a system property
+                # rather than having it spliced into its text, so no
+                # caller input is ever interpolated into code and
+                # paths with spaces need no quoting rules.
+                #
+                # Task settings are applied twice, deliberately. The
+                # early pass runs before the plugin's own afterEvaluate
+                # wiring, which snapshots each task's output files into
+                # the combined document; without it that document would
+                # resolve the default build/reports paths while the
+                # tasks themselves wrote to scratch. The late pass
+                # repeats the same values after every build script has
+                # been evaluated, so a consumer configuring these tasks
+                # cannot displace them. Configuration actions run in
+                # registration order, and one registered while the init
+                # script applies the plugin would otherwise lose.
+                #
+                # Direct SBOMs are intermediates the combined document
+                # reads. Left at their conventions they land in each
+                # project's build directory, so both are redirected to
+                # scratch. Underscores become '_u' before ':' becomes
+                # '_c', which keeps the encoding injective: ':a_:b' and
+                # ':a:_b' would otherwise collide and one project's
+                # graph would vanish from the result.
+                init_script="${gradle_scratch}/cyclonedx-init.gradle"
+                {
+                  echo "import org.cyclonedx.gradle.CyclonedxPlugin"
+                  echo "import org.cyclonedx.Version"
+                  echo ""
+                  echo "initscript {"
+                  echo "  repositories { gradlePluginPortal() }"
+                  echo "  dependencies {"
+                  echo "    classpath 'org.cyclonedx.bom:' +"
+                  echo "      'org.cyclonedx.bom.gradle.plugin:' +"
+                  echo "      System.getProperty('sbomAction.pluginVersion')"
+                  echo "  }"
+                  echo "}"
+                  echo ""
+                  echo "def prop = { String k ->"
+                  echo "  System.getProperty('sbomAction.' + k)"
+                  echo "}"
+                  echo ""
+                  echo "def wanted = prop('schemaVersion')"
+                  echo "def schema = Version.values().find {"
+                  echo "  it.versionString == wanted"
+                  echo "}"
+                  echo "def configs = prop('configs').split(',') as List"
+                  echo "def scratch = new File(prop('scratch'))"
+                  echo ""
+                  echo "def setOutputs = { t, j, x, seal ->"
+                  echo "  t.jsonOutput.fileValue(j)"
+                  echo "  t.xmlOutput.fileValue(x)"
+                  echo "  if (seal) {"
+                  echo "    t.jsonOutput.disallowChanges()"
+                  echo "    t.xmlOutput.disallowChanges()"
+                  echo "  }"
+                  echo "}"
+                  echo ""
+                  echo "def configureDirect = { p, seal ->"
+                  echo "  def direct = p.tasks.matching {"
+                  echo "    it.name == 'cyclonedxDirectBom'"
+                  echo "  }"
+                  echo "  direct.configureEach {"
+                  echo "    includeConfigs = configs"
+                  echo "    schemaVersion = schema"
+                  echo "    def s = p.path"
+                  echo "      .replace('_', '_u').replace(':', '_c')"
+                  echo "    def d = { e -> new File(scratch, s + e) }"
+                  echo "    setOutputs(delegate, d('.json'), d('.xml'), seal)"
+                  echo "  }"
+                  echo "}"
+                  echo ""
+                  echo "def configureCombined = { root, seal ->"
+                  echo "  root.tasks.named('cyclonedxBom') {"
+                  echo "    schemaVersion = schema"
+                  echo "    setOutputs(delegate, new File(prop('jsonOutput')),"
+                  echo "      new File(prop('xmlOutput')), seal)"
+                  echo "  }"
+                  echo "}"
+                  echo ""
+                  echo "rootProject {"
+                  echo "  if (schema == null) {"
+                  echo "    throw new GradleException("
+                  echo "      'plugin cannot emit CycloneDX ' + wanted)"
+                  echo "  }"
+                  echo "  apply plugin: CyclonedxPlugin"
+                  echo "  allprojects { configureDirect(it, false) }"
+                  echo "  configureCombined(delegate, false)"
+                  echo "}"
+                  echo ""
+                  echo "gradle.projectsEvaluated {"
+                  echo "  def root = gradle.rootProject"
+                  echo "  root.allprojects { configureDirect(it, true) }"
+                  echo "  configureCombined(root, true)"
+                  echo "}"
+                } > "${init_script}"
+
+                # Caller arguments are validated on their own, not as
+                # part of the final array: the action's own invocation
+                # names an init script, and a rejection list scanning
+                # everything would refuse the action's argument rather
+                # than the caller's.
+                if [ -n "${INPUT_GRADLE_ARGS}" ]; then
+                  set -f
+                  # shellcheck disable=SC2086
+                  set -- ${INPUT_GRADLE_ARGS}
+                  set +f
+                  expect_value="no"
+                  for arg in "$@"; do
+                    candidate=""
+                    if [ "${expect_value}" = "yes" ]; then
+                      candidate="${arg}"
+                      expect_value="no"
+                    else
+                      case "${arg}" in
+                        -D|--system-prop)
+                          expect_value="yes"
+                          continue ;;
+                        --system-prop=*)
+                          candidate="${arg#--system-prop=}" ;;
+                        -D*) candidate="${arg#-D}" ;;
+                        # Each of these selects a different project,
+                        # settings or build file, which would resolve a
+                        # build outside the directory this action
+                        # validated and describe it in an SBOM labelled
+                        # with path_prefix. An extra init script could
+                        # equally reconfigure the task this one sets up.
+                        -p|-p?*|--project-dir|--project-dir=*|\
+                        -c|-c?*|--settings-file|--settings-file=*|\
+                        -b|-b?*|--build-file|--build-file=*|\
+                        -I|-I?*|--init-script|--init-script=*|\
+                        --include-build|--include-build=*)
+                          echo "Error: gradle_args may not select an" \
+                            "alternate project ❌"
+                          echo "Project, settings, build-file,"
+                          echo "init-script and composite-build"
+                          echo "selection would escape the validated"
+                          echo "project directory. Use path_prefix to"
+                          echo "choose which project to scan."
+                          exit 1 ;;
+                      esac
+                    fi
+                    [ -n "${candidate}" ] || continue
+                    case "${candidate%%=*}" in
+                      sbomAction.*)
+                        echo "Error: gradle_args overrides a protected" \
+                          "property ❌"
+                        echo "Set these through the action's own inputs:"
+                        echo "  sbomAction.schemaVersion" \
+                          "-> sbom_spec_version"
+                        echo "  sbomAction.jsonOutput," \
+                          "sbomAction.xmlOutput -> output_directory"
+                        echo "  sbomAction.configs       -> include_dev"
+                        echo "  sbomAction.pluginVersion" \
+                          "-> gradle_plugin_version"
+                        exit 1 ;;
+                    esac
+                  done
+                else
+                  set --
+                fi
+
+                # Action-owned invocation first, caller arguments after
+                # it, action-owned properties last so a repeated -D
+                # resolves to this action's value and the outputs,
+                # component count and artifact contract stay intact.
+                set -- --init-script "${init_script}" cyclonedxBom \
+                  --no-daemon --console=plain "$@"
+
+                set -- "$@" \
+                  "-DsbomAction.pluginVersion=${GRADLE_PLUGIN_VERSION}" \
+                  "-DsbomAction.schemaVersion=${SPEC_VERSION}" \
+                  "-DsbomAction.configs=${gradle_configs}" \
+                  "-DsbomAction.scratch=${gradle_scratch}" \
+                  "-DsbomAction.jsonOutput=${json_path}" \
+                  "-DsbomAction.xmlOutput=${gradle_xml_out}"
+
+                echo "Generating SBOM with cyclonedx-gradle-plugin" \
+                  "${GRADLE_PLUGIN_VERSION} (test configurations:" \
+                  "${INCLUDE_DEV})"
+                # Running the build tool against the checkout makes the
+                # project EXECUTABLE INPUT, not merely metadata to be
+                # read. Gradle evaluates settings and build scripts as
+                # code before this task runs, and the wrapper itself is
+                # a script and a JAR from the checkout. The cyclonedx
+                # backend therefore requires a TRUSTED checkout, which
+                # the skip above enforces.
+                set +e
+                (cd "${PROJECT_DIR}" && "${gradle_cmd}" "$@")
+                backend_exit=$?
+                set -e
+                ;;
+            esac
             ;;
         esac
 
@@ -958,6 +1522,7 @@ runs:
           echo "::warning::SBOM generation failed; continuing" \
             "(fail_on_error: false)"
           echo "component_count=0" >> "$GITHUB_OUTPUT"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -987,6 +1552,7 @@ runs:
           emit_output "sbom_xml_path" "${xml_path}"
         fi
         echo "component_count=${component_count}" >> "$GITHUB_OUTPUT"
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
 
         echo "SBOM generation complete: ${component_count} components ✅"
         {

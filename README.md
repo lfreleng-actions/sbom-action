@@ -46,19 +46,19 @@ system it drives.
 | Backend          | Tool                             | Build tools driven | Needs a toolchain | Use for                                 |
 | ---------------- | -------------------------------- | ------------------ | ----------------- | --------------------------------------- |
 | `syft` (default) | syft static analysis             | none               | No                | Go, Node.js, Rust, containers, binaries |
-| `cyclonedx`      | CycloneDX build-tool plugins     | Maven              | JDK + build tool  | Java projects                           |
+| `cyclonedx`      | CycloneDX build-tool plugins     | Maven, Gradle      | JDK + build tool  | Java projects                           |
 
 <!-- markdownlint-enable MD013 -->
 
-That distinction matters for what comes next. `cyclonedx-gradle-plugin`
-is the same tool family solving the same problem, so Gradle support
-joins the **existing** `cyclonedx` backend rather than arriving as a
-separate `gradle` one. Callers keep the same `backend` value and the
-action detects the build system from the project.
+`cyclonedx-gradle-plugin` is the same tool family solving the same
+problem as `cyclonedx-maven-plugin`, so Gradle joins the **existing**
+`cyclonedx` backend rather than arriving as a separate one. Callers keep
+the same `backend` value, and the action resolves the build system from
+the project unless the caller declares it.
 
-Because the backend name no longer identifies the build system, the
-`dependency_manager` output reports which one actually ran (`maven`
-today). It stays empty for `syft`, which drives no build tool.
+Because the backend name does not identify the build system, the
+`dependency_manager` output reports which one ran (`maven` or `gradle`).
+It stays empty for `syft`, which drives no build tool.
 
 The `cyclonedx` backend fails fast when it cannot find a build system
 it supports, rather than attempting an invocation that cannot work.
@@ -111,9 +111,9 @@ finding.
 
 ### Trust Boundary
 
-> ⚠️ **The `cyclonedx` backend requires a trusted checkout.** Running Maven
-> against a project treats that project as *executable input* rather
-> than as inert metadata.
+> ⚠️ **The `cyclonedx` backend requires a trusted checkout.** Running a
+> build tool against a project treats that project as *executable input*
+> rather than as inert metadata.
 
 Before the SBOM goal runs, Maven will:
 
@@ -121,9 +121,19 @@ Before the SBOM goal runs, Maven will:
 - load build extensions declared in the POM;
 - read command-line arguments from `.mvn/maven.config`.
 
-No command-line flag turns any of that off, and it happens even though
-the goal never compiles source or runs tests. A project supplying a
-core extension thus executes code in the job.
+Gradle goes further, because evaluating a build *is* running code:
+
+- `settings.gradle`/`settings.gradle.kts` and every `build.gradle`
+  script execute as Groovy or Kotlin during configuration;
+- `gradle.properties` can set JVM arguments for the build process;
+- where the checkout carries a wrapper, `gradlew` is a shell script from
+  the project and `gradle-wrapper.jar` is a binary it executes, which
+  the action runs in preference to any `gradle` on `PATH`.
+
+No command-line flag turns any of that off, and for Maven it happens
+even though the goal never compiles source or runs tests. A project
+supplying a core extension, a build script or a wrapper thus executes
+code in the job.
 
 This is a real difference from the `syft` backend, which reads files
 and executes nothing from the project.
@@ -269,11 +279,26 @@ The `syft` backend downloads the syft binary via the pinned
 `anchore/sbom-action/download-syft` helper, so runners need egress to
 GitHub release assets.
 
-The `cyclonedx` backend installs a JDK with `actions/setup-java` and uses
-the Maven installation from the runner image, so runners need egress to
-the JDK distribution and to the Maven repositories the project
-resolves against (Maven Central by default). Callers running
-`harden-runner` in `block` mode must allow-list those endpoints.
+The `cyclonedx` backend installs a JDK with `actions/setup-java`, so
+runners need egress to the JDK distribution and to the repositories the
+project resolves against (Maven Central by default). Gradle adds the
+Gradle distribution host, which the wrapper downloads from, and the
+Gradle Plugin Portal, where `cyclonedx-gradle-plugin` resolves from
+rather than Maven Central. Callers running `harden-runner` in `block`
+mode must allow-list those endpoints.
+
+For Maven the action uses the installation from the runner image. For
+Gradle it runs the project's `gradlew` where the checkout has one, and
+otherwise a `gradle` on `PATH`.
+
+A project without a committed wrapper needs Gradle installed on the
+runner. GitHub-hosted images ship one; a self-hosted runner may not.
+Where neither is present the run fails with Gradle's own "command not
+found", which `fail_on_error: false` downgrades to a warning — so a
+missing toolchain need not fail the job. Committing a wrapper is the
+better remedy: it pins the Gradle version the project asks for rather
+than whichever the runner happens to carry, and `gradle-build-action`
+expects one.
 
 That backend also needs **Maven 3.6.1 or later**. The plugin itself
 supports older Maven, but the action passes `--no-transfer-progress`
@@ -317,15 +342,42 @@ them on every run so a typo surfaces regardless of the backend in use.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Required | Default   | Description                                                     |
-| -------------------- | -------- | --------- | --------------------------------------------------------------- |
-| java_version         | False    | `21`      | JDK version for the cyclonedx backend                           |
-| java_distribution    | False    | `temurin` | JDK distribution for the cyclonedx backend                      |
-| maven_plugin_version | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer              |
-| maven_args           | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace |
-| untrusted_checkout   | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`            |
+| Name                  | Required | Default   | Description                                                      |
+| --------------------- | -------- | --------- | ---------------------------------------------------------------- |
+| dependency_manager    | False    | `auto`    | Build tool: `auto`, `maven` or `gradle`                          |
+| java_version          | False    | `21`      | JDK version for the cyclonedx backend                            |
+| java_distribution     | False    | `temurin` | JDK distribution for the cyclonedx backend                       |
+| maven_plugin_version  | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer               |
+| maven_args            | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace  |
+| gradle_plugin_version | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer              |
+| gradle_version        | False    | `''`      | Gradle version the project uses; empty asks the build tool       |
+| gradle_args           | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace |
+| untrusted_checkout    | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`             |
 
 <!-- markdownlint-enable MD013 -->
+
+#### Choosing the build tool
+
+Left at `auto`, the action reads the project directory: a `pom.xml`
+selects Maven, a Gradle build script selects Gradle, and a tree carrying
+both resolves as Maven.
+
+That last case is a guess about intent, and a caller often knows better.
+A reusable workflow dedicated to one build tool always does, because the
+caller chose that workflow. `build-metadata-action` reports the same
+fact as `build_tool`, so a lane can pass it straight through:
+
+```yaml
+- uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    backend: cyclonedx
+    dependency_manager: gradle
+```
+
+A declared value still has to describe the checkout. Naming `maven` for
+a tree with no `pom.xml` fails with that explanation, rather than
+surfacing a confusing error from inside a build tool the project does
+not use.
 
 Use `maven_args` for project-specific resolution needs, for example a
 managed settings file (`-s .mvn/settings.xml`) or repository
@@ -347,6 +399,84 @@ remain authoritative even for an override form the rejection does not
 recognise. Without that, a redirected `outputDirectory` would write
 outside the validated output directory and leave the reported paths and
 component count pointing at files that were never generated.
+
+#### Gradle specifics
+
+The action runs `cyclonedxBom` on the root project, which combines the
+per-project documents from **every** project in the build, including
+nested ones. A grandchild such as `:app:nested` contributes its own
+dependencies to the result, not merely its project component — measured
+against a fixture whose nested module carries a coordinate nothing else
+in the build uses:
+
+```text
+cyclonedxBom
+cyclonedxDirectBom
+app:cyclonedxDirectBom
+app:nested:cyclonedxDirectBom
+core:cyclonedxDirectBom
+```
+
+That topology is worth stating because tooling which walks a Gradle
+build often stops at the root's immediate subprojects, and a flat
+reactor cannot tell the two behaviours apart.
+
+`gradle_args` carries the same warning and the same protections as
+`maven_args`: it splits on whitespace without shell evaluation, but
+Gradle accepts arguments that change which build runs. The action
+rejects `-p`, `-c`, `-b` and `-I` in every spelling, because each
+selects a different project, settings file, build file or init script —
+any of which would resolve a build outside the validated directory and
+describe it in an SBOM labelled with `path_prefix`. It also rejects any
+`-D` naming an `sbomAction.*` property, which is how the action passes
+its own configuration.
+
+An init script applies the plugin, so the consumer's build files need no
+entry. Unlike the Maven branch, which invokes a goal directly, Gradle
+configures the build and so creates `.gradle/` and `build/` directories
+in the checkout. That is inherent to running Gradle at all. What the
+action does prevent is the plugin leaving its own reports there: it
+redirects both the combined document and the per-project intermediates,
+keeping an artifact glob from collecting a report the caller never
+asked for.
+
+`gradle_version` exists for the floor check described below. Supplying
+it — from `build-metadata-action`'s `java_gradle_version`, for example —
+settles the question before the action downloads anything. Left empty,
+the action asks the build tool, which is authoritative but pays for the
+distribution first.
+
+#### Gradle versions below the plugin floor
+
+`cyclonedx-gradle-plugin` 3.x requires **Gradle 8.4 or newer**. Below
+that the task names differ and the requested CycloneDX schema may not
+exist, so the run cannot yield a document worth scanning.
+
+The effective floor is the later of that and Gradle's own Java
+compatibility, because Gradle also has to run on the JDK this action
+installs. On the default `java_version: 21` Gradle reaches support at
+**8.5**, so that is the floor a default configuration applies:
+
+| `java_version` | Gradle floor   |
+| -------------- | -------------- |
+| 17 to 20       | 8.4            |
+| 21             | 8.5            |
+| 22             | 8.8            |
+| 23             | 8.10           |
+| 24             | 8.14           |
+| 25             | 9.1            |
+
+A `java_version` outside that range leaves the plugin's 8.4 standing
+alone: inventing a floor for a release whose compatibility nobody has
+recorded would be a guess, and Gradle reports an unsupported JVM well
+enough on its own.
+
+The action **skips** rather than fails. An SBOM audit is not essential
+to a build, other auditing tools exist, and failing a pipeline over a
+plugin's declared dependency would punish a project for something
+unrelated to its own code. The run reports why, `skipped` returns
+`true`, and the action writes no document and reports no count — leaving
+the project free to raise its wrapper version and get results.
 
 ## Verification After Generation
 
@@ -406,12 +536,26 @@ format the caller did not request stays empty.
 drove, since the backend name identifies the tool rather than the build
 system. It stays empty for `syft`.
 
-`skipped` reports `true` when the action declined to generate, which
-today means an untrusted checkout. In that case `sbom_json_path`,
-`sbom_xml_path`, `component_count` and `dependency_manager` are all
-**empty**; `backend` still reports the backend the caller selected, as
-the validation step resolves it before the skip decision. See
-[Untrusted checkouts](#untrusted-checkouts).
+`skipped` reports `true` when the action declined to generate. Two
+conditions cause that:
+
+<!-- markdownlint-disable MD013 -->
+
+| Condition                        | `dependency_manager` | Documented at                                                                     |
+| -------------------------------- | -------------------- | --------------------------------------------------------------------------------- |
+| Untrusted checkout               | **empty**            | [Untrusted checkouts](#untrusted-checkouts)                                       |
+| Gradle below the effective floor | `gradle`             | [Gradle versions below the plugin floor](#gradle-versions-below-the-plugin-floor) |
+
+<!-- markdownlint-enable MD013 -->
+
+In both cases `sbom_json_path`, `sbom_xml_path` and `component_count`
+are **empty**, and `backend` still reports the backend the caller
+selected, since validation resolves it before either decision.
+
+`dependency_manager` differs between them because validation resolves
+the build system after the trust decision but before it can weigh the
+Gradle floor. A caller branching on a skip should read `skipped` rather
+than inferring it from empty build-tool metadata.
 
 ## Path Constraints
 
@@ -435,9 +579,30 @@ have no development scope, so the input has no effect there. Further
 per-ecosystem scoping options join the mapping as syft exposes them.
 
 The cyclonedx backend maps `include_dev` onto the plugin's
-`includeTestScope`. Maven's `test` scope is the analogue of npm
-`devDependencies`: absent from the running application, and so
+`includeTestScope` for Maven. Maven's `test` scope is the analogue of
+npm `devDependencies`: absent from the running application, and so
 excluded by default.
+
+Gradle has configurations rather than scopes, so the mapping names them
+directly. By default the backend scans `compileClasspath` and
+`runtimeClasspath`; `include_dev` adds `testCompileClasspath` and
+`testRuntimeClasspath`.
+
+Naming them matters. Left unrestricted the plugin scans **every**
+resolvable configuration, which pulls in tool classpaths such as
+`jacocoAnt` and the ASM it carries — build tooling absent from the
+shipped artefact, and noise in a vulnerability report. Measured against
+the Gradle fixture: 6 components scoped, 24 unscoped.
+
+**Custom configurations are not selectable.** The backend names
+`compileClasspath` and `runtimeClasspath` (plus the test pair under
+`include_dev`), and `gradle_args` cannot change that: the init script
+assigns `includeConfigs` from that fixed list, and the action rejects
+any `-DsbomAction.*` override. A project whose shipped dependencies
+live in a configuration outside that set sees them absent from the
+document rather than reported wrongly — so the count runs low rather
+than misleading, though it remains incomplete. Selecting configurations
+needs a dedicated input, which this action does not yet have.
 
 The plugin's other scope defaults stay as they are — `compile`,
 `runtime`, **`provided`** and **`system`** all enabled — so the BOM
@@ -515,9 +680,9 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists. `maven_args` is **not** constrained this way — the action splits it on whitespace and rejects it solely for overriding action-owned properties, leaving it trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision, and detects the build system, failing fast on one it cannot drive before installing any toolchain
+1. **Input Validation**: Validates backend, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, and skips a Gradle version below the plugin's floor where the caller supplied one
 2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java`. The selected backend guards each step, so neither costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). The `cyclonedx` backend invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. In both cases the JSON document always gets generated internally to compute the component count
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. In both cases the JSON document always gets generated internally to compute the component count
 4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary
 
 <!-- markdownlint-enable MD013 -->
