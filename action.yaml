@@ -5,7 +5,7 @@
 # sbom-action
 name: "📋 SBOM Generator"
 # yamllint disable-line rule:line-length
-description: "Generates CycloneDX SBOM reports for projects in any language/ecosystem"
+description: "Generates CycloneDX SBOM reports for projects and container images"
 # Facade action: a common interface over pluggable SBOM generation
 # backends. The interface deliberately mirrors python-sbom-action so
 # callers see one contract across the actions estate. The syft backend
@@ -32,6 +32,16 @@ description: "Generates CycloneDX SBOM reports for projects in any language/ecos
 # uv.lock), so they stay on the syft backend. Java is the outlier, and
 # driving the build tool's own resolver is the only way to see its real
 # dependency set.
+#
+# mode selects WHAT the document describes, independently of the
+# backend: 'directory' (the default) scans path_prefix, and 'image'
+# writes one SBOM per container image from docker archives. Image mode
+# exists because a single SBOM cannot describe several images, and the
+# per-image filenames form a contract with the archive producer
+# (docker-save-images-action in per-image mode) and the scanner
+# downstream. That contract is stated once here, as inputs, outputs and
+# a manifest file, rather than as a naming convention each consumer
+# re-derives.
 
 inputs:
   # Optional
@@ -43,6 +53,15 @@ inputs:
     description: "Project directory; must resolve within the workspace"
     required: false
     default: "."
+  mode:
+    description: "What to describe: 'directory' (path_prefix) or 'image'"
+    required: false
+    default: "directory"
+  image_archive_directory:
+    # yamllint disable-line rule:line-length
+    description: "Image mode: directory of docker archives, one image per *.tar file"
+    required: false
+    default: ""
   sbom_format:
     description: "SBOM output format: 'json', 'xml', or 'both'"
     required: false
@@ -146,6 +165,20 @@ outputs:
     # failure that stops the step from running at all.
     # yamllint disable-line rule:line-length
     value: ${{ steps.generate.outputs.skipped || steps.validate.outputs.skipped }}
+  image_count:
+    description: "Image mode: number of images described"
+    value: ${{ steps.generate.outputs.image_count }}
+  sboms_json:
+    # yamllint disable-line rule:line-length
+    description: "Image mode: JSON array describing each image SBOM (the manifest)"
+    value: ${{ steps.generate.outputs.sboms_json }}
+  manifest_path:
+    description: "Image mode: path to the manifest file"
+    value: ${{ steps.generate.outputs.manifest_path }}
+  artifact_paths:
+    # yamllint disable-line rule:line-length
+    description: "Image mode: newline-separated files written, manifest included"
+    value: ${{ steps.generate.outputs.artifact_paths }}
 
 runs:
   using: "composite"
@@ -156,9 +189,13 @@ runs:
       env:
         INPUT_BACKEND: ${{ inputs.backend }}
         INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_MODE: ${{ inputs.mode }}
+        # yamllint disable-line rule:line-length
+        INPUT_IMAGE_ARCHIVE_DIRECTORY: ${{ inputs.image_archive_directory }}
         INPUT_SBOM_FORMAT: ${{ inputs.sbom_format }}
         INPUT_SBOM_SPEC_VERSION: ${{ inputs.sbom_spec_version }}
         INPUT_FILENAME_PREFIX: ${{ inputs.filename_prefix }}
+        INPUT_OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
         INPUT_INCLUDE_DEV: ${{ inputs.include_dev }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
         INPUT_JAVA_VERSION: ${{ inputs.java_version }}
@@ -185,6 +222,14 @@ runs:
             exit 1
           fi
         done
+        # Image mode reads each archive's manifest with tar before
+        # scanning; without it every archive would look malformed
+        if [ "${INPUT_MODE}" = "image" ] && \
+          ! command -v tar > /dev/null 2>&1; then
+          echo "Error: required tool not found: tar ❌"
+          echo "Image mode requires tar on the runner"
+          exit 1
+        fi
         # The action requires GNU coreutils: realpath -m (missing-path
         # resolution) and sort -V (version sort). BSD/macOS lacks both,
         # and failing here gives a clearer error than a mid-run failure
@@ -216,6 +261,30 @@ runs:
             echo "Supported backends: syft, cyclonedx"
             exit 1 ;;
         esac
+        case "${INPUT_MODE}" in
+          directory|image) ;;
+          *)
+            echo "Error: mode must be 'directory' or 'image' ❌"
+            exit 1 ;;
+        esac
+        # Image mode reads docker archives, which only syft can do: the
+        # cyclonedx backend drives a build tool against a source tree.
+        # The archive directory is required there and refused anywhere
+        # else, so a caller who sets it but forgets the mode gets an
+        # error rather than a quiet SBOM of the workspace.
+        if [ "${INPUT_MODE}" = "image" ]; then
+          if [ "${INPUT_BACKEND}" != "syft" ]; then
+            echo "Error: mode 'image' requires backend 'syft' ❌"
+            exit 1
+          fi
+          if [ -z "${INPUT_IMAGE_ARCHIVE_DIRECTORY}" ]; then
+            echo "Error: mode 'image' requires image_archive_directory ❌"
+            exit 1
+          fi
+        elif [ -n "${INPUT_IMAGE_ARCHIVE_DIRECTORY}" ]; then
+          echo "Error: image_archive_directory needs mode 'image' ❌"
+          exit 1
+        fi
         case "${INPUT_SBOM_FORMAT}" in
           json|xml|both) ;;
           *)
@@ -348,35 +417,94 @@ runs:
               "or 'gradle' ❌"
             exit 1 ;;
         esac
-        # Anchor relative paths to GITHUB_WORKSPACE: composite
-        # actions can run with a caller-set working directory, so
-        # resolving against the current directory would be
-        # non-deterministic
-        case "${INPUT_PATH_PREFIX}" in
-          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
-          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
-        esac
-        if [ ! -d "${project_dir}" ]; then
-          echo "Error: invalid project directory ❌"
-          # Strip CR/LF before logging the untrusted path: embedded
-          # newlines could otherwise inject workflow commands via the
-          # log stream
-          printf 'Path not found: %s\n' \
-            "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
-          exit 1
-        fi
-        # Restrict scanning to the workspace: an absolute or escaped
-        # path could otherwise expose runner filesystem details in the
-        # SBOM and any uploaded artifacts
-        resolved="$(realpath -- "${project_dir}")"
         workspace="$(realpath -- "${GITHUB_WORKSPACE}")"
-        case "${resolved}/" in
-          "${workspace}/"*) ;;
-          *)
-            echo "Error: project directory escapes the workspace ❌"
-            echo "path_prefix must resolve within GITHUB_WORKSPACE"
-            exit 1 ;;
-        esac
+        # path_prefix plays no part in image mode, so it is neither
+        # resolved nor checked there: a stale or absent value must not
+        # fail a run that never reads it
+        if [ "${INPUT_MODE}" != "image" ]; then
+          # Anchor relative paths to GITHUB_WORKSPACE: composite
+          # actions can run with a caller-set working directory, so
+          # resolving against the current directory would be
+          # non-deterministic
+          case "${INPUT_PATH_PREFIX}" in
+            /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+            *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+          esac
+          if [ ! -d "${project_dir}" ]; then
+            echo "Error: invalid project directory ❌"
+            # Strip CR/LF before logging the untrusted path: embedded
+            # newlines could otherwise inject workflow commands via the
+            # log stream
+            printf 'Path not found: %s\n' \
+              "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
+            exit 1
+          fi
+          # Restrict scanning to the workspace: an absolute or escaped
+          # path could otherwise expose runner filesystem details in
+          # the SBOM and any uploaded artifacts
+          resolved="$(realpath -- "${project_dir}")"
+          case "${resolved}/" in
+            "${workspace}/"*) ;;
+            *)
+              echo "Error: project directory escapes the workspace ❌"
+              echo "path_prefix must resolve within GITHUB_WORKSPACE"
+              exit 1 ;;
+          esac
+        fi
+        # The archive directory is read rather than written, but it gets
+        # the output_directory boundary all the same: syft records what
+        # it reads in the SBOM, so an arbitrary path would put runner
+        # filesystem content into a published document. RUNNER_TEMP is
+        # allowed because that is where a job downloads artifacts that
+        # are not part of its checkout.
+        if [ "${INPUT_MODE}" = "image" ]; then
+          case "${INPUT_IMAGE_ARCHIVE_DIRECTORY}" in
+            /*) archive_dir="${INPUT_IMAGE_ARCHIVE_DIRECTORY}" ;;
+            *)
+              archive_dir="${GITHUB_WORKSPACE}/${INPUT_IMAGE_ARCHIVE_DIRECTORY}"
+              ;;
+          esac
+          if [ ! -d "${archive_dir}" ]; then
+            echo "Error: invalid image archive directory ❌"
+            printf 'Path not found: %s\n' \
+              "$(printf '%s' "${archive_dir}" | tr -d '\r\n')"
+            exit 1
+          fi
+          archive_dir="$(realpath -- "${archive_dir}")"
+          temp_dir="$(realpath -- "${RUNNER_TEMP}")"
+          case "${archive_dir}/" in
+            "${workspace}/"*|"${temp_dir}/"*) ;;
+            *)
+              echo "Error: image archive directory escapes the" \
+                "workspace ❌"
+              echo "image_archive_directory must resolve within"
+              echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+              exit 1 ;;
+          esac
+          # artifact_paths lists one file per line for
+          # actions/upload-artifact, which reads each line as a glob.
+          # A line break would split a path and glob syntax would
+          # select other files, so image mode refuses both in the
+          # output directory. Labels and filename_prefix already
+          # exclude them.
+          case "${INPUT_OUTPUT_DIRECTORY}" in
+            *[\*\?\[\]\\]*|*$'\n'*|*$'\r'*)
+              echo "Error: output_directory holds characters image" \
+                "mode cannot list ❌"
+              echo "In image mode output_directory must not contain"
+              echo "line breaks or any of: * ? [ ] \\"
+              exit 1 ;;
+          esac
+          # upload-artifact skips hidden files unless told otherwise,
+          # judging each listed path by its file name alone, so a
+          # prefix starting with '.' would publish nothing
+          case "${INPUT_FILENAME_PREFIX}" in
+            .*)
+              echo "Error: filename_prefix must not start with '.'" \
+                "in image mode ❌"
+              exit 1 ;;
+          esac
+        fi
         echo "backend=${INPUT_BACKEND}" >> "$GITHUB_OUTPUT"
 
         # Decide whether the checkout can be trusted to execute.
@@ -638,6 +766,8 @@ runs:
         SKIP_REASON: ${{ steps.validate.outputs.skip_reason }}
         SYFT_CMD: ${{ steps.syft.outputs.cmd }}
         PROJECT_DIR: ${{ inputs.path_prefix }}
+        MODE: ${{ inputs.mode }}
+        IMAGE_ARCHIVE_DIRECTORY: ${{ inputs.image_archive_directory }}
         SBOM_FORMAT: ${{ inputs.sbom_format }}
         SPEC_VERSION: ${{ inputs.sbom_spec_version }}
         FILENAME_PREFIX: ${{ inputs.filename_prefix }}
@@ -679,24 +809,28 @@ runs:
         # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
         # deterministic when the caller sets a working directory. The
         # :? expansions hard-fail on unset/empty runner variables,
-        # which would otherwise weaken the boundary checks below
-        case "${PROJECT_DIR}" in
-          /*) ;;
-          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
-        esac
-        # Re-resolve and enforce the workspace boundary at the point
-        # of use: the workspace is mutable between steps, so relying
-        # solely on the earlier validate step would leave a TOCTOU
-        # gap (a validated directory swapped for an escaping symlink)
-        PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")"
-        boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")"
-        case "${PROJECT_DIR}/" in
-          "${boundary}/"*) ;;
-          *)
-            echo "Error: project directory escapes the workspace ❌"
-            echo "path_prefix must resolve within GITHUB_WORKSPACE"
-            exit 1 ;;
-        esac
+        # which would otherwise weaken the boundary checks below.
+        # Image mode never reads path_prefix, so skips it here as in
+        # validation.
+        if [ "${MODE}" != "image" ]; then
+          case "${PROJECT_DIR}" in
+            /*) ;;
+            *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+          esac
+          # Re-resolve and enforce the workspace boundary at the point
+          # of use: the workspace is mutable between steps, so relying
+          # solely on the earlier validate step would leave a TOCTOU
+          # gap (a validated directory swapped for an escaping symlink)
+          PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")"
+          boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")"
+          case "${PROJECT_DIR}/" in
+            "${boundary}/"*) ;;
+            *)
+              echo "Error: project directory escapes the workspace ❌"
+              echo "path_prefix must resolve within GITHUB_WORKSPACE"
+              exit 1 ;;
+          esac
+        fi
         # Convert the output directory to an absolute path anchored
         # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
         # any mkdir, and the boundary check applies in ALL cases: the
@@ -721,6 +855,20 @@ runs:
             echo "GITHUB_WORKSPACE or RUNNER_TEMP"
             exit 1 ;;
         esac
+        # Checked again on the resolved path, which is what
+        # artifact_paths lists: a symlinked output directory or the
+        # workspace path itself could carry what the input did not.
+        # See the validation step for why.
+        if [ "${MODE}" = "image" ]; then
+          case "${OUTPUT_DIR}" in
+            *[\*\?\[\]\\]*|*$'\n'*|*$'\r'*)
+              echo "Error: output_directory holds characters image" \
+                "mode cannot list ❌"
+              echo "In image mode output_directory must not contain"
+              echo "line breaks or any of: * ? [ ] \\"
+              exit 1 ;;
+          esac
+        fi
         mkdir -p -- "${OUTPUT_DIR}"
 
         json_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.json"
@@ -809,6 +957,28 @@ runs:
                 'http://cyclonedx.org/schema/bom/'*' bom')
                   looks_like_bom="yes" ;;
               esac ;;
+            manifest)
+              # Image mode's manifest is not a BOM, so it gets its own
+              # structural test: a non-empty array whose every entry
+              # has exactly the fields that mode writes, with their
+              # types. A failed run never leaves an empty manifest, so
+              # [] is someone else's file.
+              if jq -e 'type == "array" and length > 0 and all(.[];
+                type == "object"
+                and (keys == ["archive", "component_count", "format",
+                  "image", "label", "sbom_json", "sbom_xml",
+                  "spec_version"])
+                and .format == "cyclonedx"
+                and (.label | type == "string")
+                and (.archive | type == "string")
+                and (.image | type == "string" or type == "null")
+                and (.spec_version | type == "string")
+                and (.sbom_json | type == "string" or type == "null")
+                and (.sbom_xml | type == "string" or type == "null")
+                and (.component_count | type == "number"))' \
+                "${target}" > /dev/null 2>&1; then
+                looks_like_bom="yes"
+              fi ;;
           esac
           if [ "${looks_like_bom}" != "yes" ]; then
             echo "Error: refusing to overwrite a non-SBOM file ❌"
@@ -821,6 +991,467 @@ runs:
           fi
           rm -f -- "${target}"
         }
+
+        # Path values derive from the caller-controlled output_directory
+        # and can legally contain newlines, so they use the multiline
+        # heredoc output format with a random delimiter (built from
+        # shell-builtin randomness, regenerated until provably absent
+        # from the value) to prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        # Checks a generated JSON document, setting failure_reason on
+        # rejection and component_count on success. Shared by both
+        # modes, so an image SBOM passes exactly the gate a directory
+        # SBOM does.
+        verify_json_document() {
+          document="$1"
+          # Confirm the document declares the specification version
+          # the caller asked for. cyclonedx-maven-plugin silently falls
+          # back to its own default for a version it does not support
+          # rather than failing, so an unsupported sbom_spec_version
+          # would otherwise yield a success claiming a version the
+          # document does not carry.
+          #
+          # Assigned inside the condition so a parse failure lands in
+          # failure_reason rather than aborting the step: a bare
+          # command substitution would exit nonzero under 'set -e',
+          # bypassing fail_on_error and leaving the rejected document
+          # on disk for the artifact glob to collect.
+          if ! actual_spec="$(jq -r '.specVersion // ""' \
+            "${document}" 2> /dev/null)"; then
+            failure_reason="the generated JSON document is malformed"
+            return 0
+          fi
+          if [ "${actual_spec}" != "${SPEC_VERSION}" ]; then
+            failure_reason="requested CycloneDX ${SPEC_VERSION} but the"
+            failure_reason="${failure_reason} document declares"
+            failure_reason="${failure_reason} ${actual_spec:-none}"
+            return 0
+          fi
+          # Read here rather than after the failure handler. A document
+          # can be valid JSON, carry the right specVersion, and still
+          # have a components value jq cannot measure - {"components":
+          # true} parses, passes the version gate, and errors on length.
+          # Computing it inside verification routes that through
+          # fail_on_error instead of yielding a clean result reporting
+          # zero components.
+          #
+          # 'length' alone does not establish an array: jq returns a
+          # key count for an object and a character count for a
+          # string, so {"components":{"x":1}} and
+          # {"components":"abc"} would publish counts of 1 and 3. The
+          # type is asserted explicitly, with a missing components key
+          # still meaning zero.
+          if ! component_count="$(jq '
+            if (.components == null) then 0
+            elif (.components | type) == "array"
+              then (.components | length)
+            else error("components is not an array")
+            end' "${document}" 2> /dev/null)"; then
+            failure_reason="the generated JSON document has no usable"
+            failure_reason="${failure_reason} components array"
+          fi
+        }
+
+        # Image mode: one SBOM per docker archive. Dispatched before the
+        # directory-mode destinations are touched, because the two modes
+        # own different names: image mode must neither clear nor write
+        # ${FILENAME_PREFIX}.json/.xml.
+        #
+        # The names it owns form the contract with its neighbours. The
+        # archive producer (docker-save-images-action, per-image mode)
+        # writes <label>.tar per image; this writes
+        # ${FILENAME_PREFIX}-<label>.json/.xml beside a
+        # ${FILENAME_PREFIX}.manifest.json listing every image. The
+        # manifest's dot keeps it outside the ${FILENAME_PREFIX}-*.json
+        # glob a scanner uses to find the documents.
+        if [ "${MODE}" = "image" ]; then
+          # Re-resolved and re-checked at the point of use, for the
+          # same TOCTOU reason as PROJECT_DIR above
+          case "${IMAGE_ARCHIVE_DIRECTORY}" in
+            /*) archive_dir="${IMAGE_ARCHIVE_DIRECTORY}" ;;
+            *)
+              archive_dir="${GITHUB_WORKSPACE:?}/${IMAGE_ARCHIVE_DIRECTORY}"
+              ;;
+          esac
+          if [ ! -d "${archive_dir}" ]; then
+            echo "Error: invalid image archive directory ❌"
+            exit 1
+          fi
+          archive_dir="$(realpath -- "${archive_dir}")"
+          case "${archive_dir}/" in
+            "${workspace}/"*|"${temp_dir}/"*) ;;
+            *)
+              echo "Error: image archive directory escapes the" \
+                "workspace ❌"
+              echo "image_archive_directory must resolve within"
+              echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+              exit 1 ;;
+          esac
+
+          # Byte-order collation, so the manifest lists images in the
+          # same order on every runner whatever its locale. dotglob
+          # because the contract is every *.tar, and a label may start
+          # with a dot; a bare .tar fails the label check below.
+          LC_ALL=C
+          shopt -s nullglob dotglob
+          archives=("${archive_dir}"/*.tar)
+          shopt -u nullglob dotglob
+
+          # Check every archive against the contract before scanning
+          # any of them. These are input errors, not generation
+          # errors, so they fail regardless of fail_on_error: relaxing
+          # them would let a misconfigured lane publish SBOMs that
+          # describe the wrong thing.
+          labels=()
+          images=()
+          # The reference grammar of distribution/reference, which
+          # Docker parses with, less IPv6 registry hosts: their
+          # brackets fail the character test before this applies.
+          # RepoTags always carry a tag; the digest is accepted for
+          # completeness.
+          ref_part='[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*'
+          ref_host='([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])'
+          ref_domain="${ref_host}(\.${ref_host})*(:[0-9]+)?"
+          ref_name="(${ref_domain}/)?${ref_part}(/${ref_part})*"
+          ref_tag='[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}'
+          ref_digest='[A-Za-z][A-Za-z0-9]*([-_+.][A-Za-z][A-Za-z0-9]*)*'
+          ref_digest="${ref_digest}:[0-9a-fA-F]{32,}"
+          reference_pattern="^${ref_name}(:${ref_tag})?(@${ref_digest})?\$"
+          for archive in "${archives[@]}"; do
+            label="${archive##*/}"
+            label="${label%.tar}"
+            # The label becomes part of a filename, an output and a
+            # log line. docker-save-images-action maps '/' and ':' in
+            # the image reference to '_', so a reference it saved fits
+            # this set ('@' covers digest references) unless its
+            # registry is an IPv6 address: the brackets survive the
+            # mapping, and such archives are refused here.
+            case "${label}" in
+              *[!A-Za-z0-9._@-]*|'')
+                echo "Error: unsupported archive name ❌"
+                printf 'Archive: %s\n' \
+                  "$(printf '%s' "${archive##*/}" | tr -d '\r\n')"
+                echo "Allowed characters: A-Z a-z 0-9 . _ @ -"
+                exit 1 ;;
+            esac
+            # A link could point the scan at any file on the runner,
+            # which syft would then describe in a published document
+            if [ -L "${archive}" ] || [ ! -f "${archive}" ]; then
+              echo "Error: archive is not a regular file ❌"
+              echo "Archive: ${label}.tar"
+              exit 1
+            fi
+            # docker save records each image it wrote in manifest.json.
+            # Reading it here states the one-image-per-archive rule up
+            # front (syft's own error for a combined archive is
+            # 'cannot process multiple docker manifests') and yields
+            # the image reference, so consumers can name each image
+            # from data rather than by reversing the filename mapping.
+            if ! image_manifest="$(tar -xOf "${archive}" manifest.json \
+              2> /dev/null)"; then
+              echo "Error: archive has no manifest.json ❌"
+              echo "Archive: ${label}.tar"
+              echo "Expected a docker archive written by docker save"
+              exit 1
+            fi
+            if ! jq -e 'type == "array" and length == 1' \
+              <<< "${image_manifest}" > /dev/null 2>&1; then
+              echo "Error: archive must hold exactly one image ❌"
+              echo "Archive: ${label}.tar"
+              echo "Save one image per archive, for example with"
+              echo "docker-save-images-action in per-image mode"
+              exit 1
+            fi
+            # The entry must name its config and layers, and the
+            # archive must hold each of them, so that a scan failure
+            # past this point is a generation error rather than a
+            # malformed input. tar lists a member name holding a line
+            # break escaped, so such a name cannot match and fails
+            # closed.
+            if ! archive_members="$(tar -tf "${archive}" 2> /dev/null)" \
+              || ! jq -e --arg members "${archive_members}" '
+                ($members | split("\n") | map({(.): true}) | add // {})
+                  as $present
+                | .[0]
+                | (.Config | type == "string")
+                  and (.Layers | type == "array"
+                    and all(.[]; type == "string"))
+                  and all(.Config, .Layers[]; $present[.] == true)' \
+                <<< "${image_manifest}" > /dev/null 2>&1; then
+              echo "Error: archive is not a complete docker archive ❌"
+              echo "Archive: ${label}.tar"
+              echo "Its manifest.json must name a Config and Layers"
+              echo "that the archive contains"
+              exit 1
+            fi
+            # RepoTags is absent or null for an untagged image, and
+            # otherwise a list of strings. Every entry must be a
+            # well-formed reference, not just the first, which names
+            # the image. Characters are checked in jq, so each entry
+            # is known to be one line before the shell splits them.
+            if ! repo_tags="$(jq -r '.[0].RepoTags
+              | if . == null then []
+                elif type == "array" and all(.[]; type == "string"
+                  and test("\\A[A-Za-z0-9._/:@-]+\\z")) then .
+                else error("RepoTags") end
+              | .[]' <<< "${image_manifest}" 2> /dev/null)"; then
+              echo "Error: archive records a malformed image" \
+                "reference ❌"
+              echo "Archive: ${label}.tar"
+              exit 1
+            fi
+            image_ref=""
+            while IFS= read -r repo_tag; do
+              [ -n "${repo_tag}" ] || continue
+              # distribution/reference bounds the repository path at
+              # 255 characters once Docker has normalised the name:
+              # the registry domain is split off, and an official
+              # image gains an implicit library/ (splitDockerDomain).
+              # The tag and digest have their own bounds in the
+              # pattern.
+              ref_repo="${repo_tag%%@*}"
+              case "${ref_repo##*/}" in
+                *:*) ref_repo="${ref_repo%:*}" ;;
+              esac
+              ref_path="${ref_repo}"
+              ref_domain_part="docker.io"
+              case "${ref_repo}" in
+                */*)
+                  ref_first="${ref_repo%%/*}"
+                  case "${ref_first}" in
+                    *.*|*:*|localhost)
+                      ref_domain_part="${ref_first}"
+                      ref_path="${ref_repo#*/}" ;;
+                    *)
+                      if [ "${ref_first}" != "${ref_first,,}" ]; then
+                        ref_domain_part="${ref_first}"
+                        ref_path="${ref_repo#*/}"
+                      fi ;;
+                  esac ;;
+              esac
+              case "${ref_domain_part}" in
+                docker.io|index.docker.io)
+                  case "${ref_path}" in
+                    */*) ;;
+                    *) ref_path="library/${ref_path}" ;;
+                  esac ;;
+              esac
+              if ! [[ "${repo_tag}" =~ ${reference_pattern} ]] || \
+                [ "${#ref_path}" -gt 255 ]; then
+                echo "Error: archive records a malformed image" \
+                  "reference ❌"
+                echo "Archive: ${label}.tar"
+                exit 1
+              fi
+              if [ -z "${image_ref}" ]; then
+                image_ref="${repo_tag}"
+              fi
+            done <<< "${repo_tags}"
+            labels+=("${label}")
+            images+=("${image_ref}")
+          done
+
+          manifest_path="${OUTPUT_DIR}/${FILENAME_PREFIX}.manifest.json"
+          # Cleared before generating, on the same terms and for the
+          # same reasons as directory mode clears its destinations
+          purge_destination "${manifest_path}" manifest
+          for label in "${labels[@]}"; do
+            purge_destination \
+              "${OUTPUT_DIR}/${FILENAME_PREFIX}-${label}.json" json
+            purge_destination \
+              "${OUTPUT_DIR}/${FILENAME_PREFIX}-${label}.xml" xml
+          done
+
+          image_scratch="$(mktemp -d "${RUNNER_TEMP}/sbom-image.XXXXXX")"
+          # All or nothing, as in directory mode: a partial set would
+          # pass a downstream glob as a complete one. The trap, armed
+          # only once every destination has been cleared, covers any
+          # exit before the run publishes, including an unexpected
+          # failure under -e after the documents exist. Unguarded
+          # removal is safe because purge_destination cleared every
+          # one of these paths above.
+          published="no"
+          manifest_tmp=""
+          remove_image_outputs() {
+            local doc_label
+            for doc_label in "${labels[@]}"; do
+              rm -f -- \
+                "${OUTPUT_DIR}/${FILENAME_PREFIX}-${doc_label}.json" \
+                "${OUTPUT_DIR}/${FILENAME_PREFIX}-${doc_label}.xml"
+            done
+            rm -f -- "${manifest_path}"
+          }
+          cleanup_image_run() {
+            rm -rf -- "${image_scratch}"
+            if [ -n "${manifest_tmp}" ]; then
+              rm -f -- "${manifest_tmp}"
+            fi
+            if [ "${published}" != "yes" ]; then
+              remove_image_outputs
+            fi
+          }
+          trap cleanup_image_run EXIT
+          entries="${image_scratch}/entries.jsonl"
+          : > "${entries}"
+
+          failure_reason=""
+          if [ "${#labels[@]}" -eq 0 ]; then
+            failure_reason="no docker archives (*.tar) to scan"
+          fi
+          total=0
+          written=()
+          for index in "${!labels[@]}"; do
+            label="${labels[${index}]}"
+            image_ref="${images[${index}]}"
+            json_out="${OUTPUT_DIR}/${FILENAME_PREFIX}-${label}.json"
+            xml_out="${OUTPUT_DIR}/${FILENAME_PREFIX}-${label}.xml"
+            # As in directory mode, the JSON document is always
+            # generated because the count and checks derive from it;
+            # for xml-only runs it is scratch and never published
+            json_doc="${json_out}"
+            if [ "${SBOM_FORMAT}" = "xml" ]; then
+              json_doc="${image_scratch}/${label}.json"
+            fi
+            set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_doc}"
+            if [ "${SBOM_FORMAT}" != "json" ]; then
+              set -- "$@" -o "cyclonedx-xml@${SPEC_VERSION}=${xml_out}"
+              written+=("${xml_out}")
+            fi
+            if [ "${SBOM_FORMAT}" != "xml" ]; then
+              written+=("${json_out}")
+            fi
+            # Without a source name syft records the archive's path on
+            # the runner as the document's subject. The image reference
+            # is what the document describes, with the label standing
+            # in for an untagged image.
+            echo "::group::SBOM ${label}"
+            set +e
+            "${SYFT_CMD}" scan "docker-archive:${archive_dir}/${label}.tar" \
+              -q --source-name "${image_ref:-${label}}" "$@"
+            backend_exit=$?
+            set -e
+            echo "::endgroup::"
+            if [ "${backend_exit}" != "0" ]; then
+              failure_reason="syft exited with code ${backend_exit}"
+            elif [ ! -f "${json_doc}" ]; then
+              failure_reason="no JSON document produced"
+            elif [ "${SBOM_FORMAT}" != "json" ] && \
+              [ ! -f "${xml_out}" ]; then
+              failure_reason="no XML document produced"
+            else
+              verify_json_document "${json_doc}"
+            fi
+            if [ -n "${failure_reason}" ]; then
+              failure_reason="${failure_reason} for ${label}"
+              break
+            fi
+            echo "${label}: ${component_count} components"
+            total=$((total + component_count))
+            sbom_json=""
+            sbom_xml=""
+            if [ "${SBOM_FORMAT}" != "xml" ]; then
+              sbom_json="${json_out##*/}"
+            fi
+            if [ "${SBOM_FORMAT}" != "json" ]; then
+              sbom_xml="${xml_out##*/}"
+            fi
+            # Paths are relative to the manifest's directory, so the
+            # manifest stays valid once uploaded and downloaded
+            # elsewhere. Absent formats are null rather than missing,
+            # so every entry has the same shape.
+            jq -nc \
+              --arg label "${label}" \
+              --arg image "${image_ref}" \
+              --arg archive "${label}.tar" \
+              --arg spec "${SPEC_VERSION}" \
+              --arg json "${sbom_json}" \
+              --arg xml "${sbom_xml}" \
+              --argjson count "${component_count}" \
+              '{label: $label,
+                image: (if $image == "" then null else $image end),
+                archive: $archive,
+                format: "cyclonedx",
+                spec_version: $spec,
+                sbom_json: (if $json == "" then null else $json end),
+                sbom_xml: (if $xml == "" then null else $xml end),
+                component_count: $count}' >> "${entries}"
+          done
+
+          if [ -n "${failure_reason}" ]; then
+            echo "SBOM generation failed: ${failure_reason}"
+            remove_image_outputs
+            {
+              echo "## 📋 SBOM Generation Results"
+              echo ""
+              echo "SBOM generation failed (${failure_reason}) ❌"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "${FAIL_ON_ERROR}" = "true" ]; then
+              echo "::error::SBOM generation failed ❌"
+              exit 1
+            fi
+            echo "::warning::SBOM generation failed; continuing" \
+              "(fail_on_error: false)"
+            {
+              echo "component_count=0"
+              echo "image_count=0"
+              echo "sboms_json=[]"
+              echo "skipped=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Written beside its destination and renamed into place, so
+          # the manifest path never holds a partial document
+          manifest_tmp="$(mktemp \
+            "${OUTPUT_DIR}/.${FILENAME_PREFIX}.manifest.XXXXXX")"
+          jq -s '.' "${entries}" > "${manifest_tmp}"
+          chmod 0644 "${manifest_tmp}"
+          mv -f -- "${manifest_tmp}" "${manifest_path}"
+          manifest_tmp=""
+          written+=("${manifest_path}")
+          emit_output "sboms_json" "$(jq -c '.' "${manifest_path}")"
+          emit_output "manifest_path" "${manifest_path}"
+          emit_output "artifact_paths" "$(printf '%s\n' "${written[@]}")"
+          {
+            echo "image_count=${#labels[@]}"
+            echo "component_count=${total}"
+            echo "skipped=false"
+          } >> "$GITHUB_OUTPUT"
+          published="yes"
+
+          echo "SBOM generation complete: ${#labels[@]} images," \
+            "${total} components ✅"
+          {
+            echo "## 📋 SBOM Generation Results"
+            echo ""
+            echo "**Backend:** ${BACKEND}"
+            echo "**Mode:** image"
+            echo "**Format:** ${SBOM_FORMAT}"
+            echo "**Specification Version:** ${SPEC_VERSION}"
+            echo "**Images:** ${#labels[@]}"
+            echo "**Components Found:** ${total}"
+            echo ""
+            echo "| Image | Label | Components |"
+            echo "| ----- | ----- | ---------- |"
+            jq -r '.[] | "| `\(.image // "(untagged)")` | `\(.label)` | " +
+              "\(.component_count) |"' "${manifest_path}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
         # Both destinations, regardless of the requested format. The
         # action owns ${FILENAME_PREFIX}.json and
         # ${FILENAME_PREFIX}.xml under output_directory: they derive
@@ -1446,51 +2077,8 @@ runs:
           [ "${SBOM_FORMAT}" != "json" ] && [ ! -f "${xml_path}" ]; then
           failure_reason="no XML document produced"
         fi
-        # Confirm the document declares the specification version the
-        # caller asked for. cyclonedx-maven-plugin silently falls back
-        # to its own default for a version it does not support rather
-        # than failing, so an unsupported sbom_spec_version would
-        # otherwise yield a success claiming a version the document
-        # does not carry.
         if [ -z "${failure_reason}" ]; then
-          # Assigned inside the condition so a parse failure lands in
-          # failure_reason rather than aborting the step: a bare
-          # command substitution would exit nonzero under 'set -e',
-          # bypassing fail_on_error and leaving the rejected document
-          # on disk for the artifact glob to collect.
-          if ! actual_spec="$(jq -r '.specVersion // ""' \
-            "${json_path}" 2> /dev/null)"; then
-            failure_reason="the generated JSON document is malformed"
-          elif [ "${actual_spec}" != "${SPEC_VERSION}" ]; then
-            failure_reason="requested CycloneDX ${SPEC_VERSION} but the"
-            failure_reason="${failure_reason} document declares"
-            failure_reason="${failure_reason} ${actual_spec:-none}"
-          fi
-        fi
-
-        # Read here rather than after the handler below. A document
-        # can be valid JSON, carry the right specVersion, and still
-        # have a components value jq cannot measure - {"components":
-        # true} parses, passes the version gate, and errors on length.
-        # Computing it inside the verification block routes that
-        # through fail_on_error instead of yielding a clean result
-        # reporting zero components.
-        if [ -z "${failure_reason}" ]; then
-          # 'length' alone does not establish an array: jq returns a
-          # key count for an object and a character count for a
-          # string, so {"components":{"x":1}} and
-          # {"components":"abc"} would publish counts of 1 and 3. The
-          # type is asserted explicitly, with a missing components key
-          # still meaning zero.
-          if ! component_count="$(jq '
-            if (.components == null) then 0
-            elif (.components | type) == "array"
-              then (.components | length)
-            else error("components is not an array")
-            end' "${json_path}" 2> /dev/null)"; then
-            failure_reason="the generated JSON document has no usable"
-            failure_reason="${failure_reason} components array"
-          fi
+          verify_json_document "${json_path}"
         fi
 
         if [ -n "${failure_reason}" ]; then
@@ -1526,25 +2114,6 @@ runs:
           exit 0
         fi
 
-        # Emit outputs; paths only for the formats the caller requested.
-        # Path values derive from the caller-controlled output_directory
-        # and can legally contain newlines, so they use the multiline
-        # heredoc output format with a random delimiter (built from
-        # shell-builtin randomness, regenerated until provably absent
-        # from the value) to prevent output-file injection
-        emit_output() {
-          key="$1"
-          value="$2"
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
-            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-          done
-          {
-            printf '%s<<%s\n' "${key}" "${delimiter}"
-            printf '%s\n' "${value}"
-            printf '%s\n' "${delimiter}"
-          } >> "$GITHUB_OUTPUT"
-        }
         if [ "${SBOM_FORMAT}" != "xml" ]; then
           emit_output "sbom_json_path" "${json_path}"
         fi

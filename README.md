@@ -11,7 +11,7 @@
 <!-- prettier-ignore-end -->
 
 Generates CycloneDX Software Bill of Materials (SBOM) reports for
-projects in any language/ecosystem.
+projects in any language/ecosystem, and for container images.
 
 ## sbom-action
 
@@ -28,6 +28,10 @@ downstream job.
 A second backend runs the CycloneDX project's own build-tool plugins
 for Java projects, where static analysis falls short. See
 [Backends](#backends) for how to choose between them.
+
+The `mode` input chooses what the document describes: a project
+directory (the default), or one SBOM per container image from docker
+archives. See [Container images](#container-images).
 
 The interface mirrors
 [python-sbom-action](https://github.com/lfreleng-actions/python-sbom-action),
@@ -256,7 +260,8 @@ steps:
 ## Requirements
 
 The action needs `jq`, `realpath` and `sort` (the latter two from GNU
-coreutils, for `realpath -m` and `sort -V`) and `mktemp` on the runner.
+coreutils, for `realpath -m` and `sort -V`) and `mktemp` on the runner,
+plus `tar` in image mode.
 GitHub-hosted Ubuntu runners include these tools; minimal self-hosted
 or non-Linux runners must provide them. The action checks for them up
 front and fails with a clear error naming any missing tool.
@@ -321,17 +326,19 @@ exists.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name              | Required | Default          | Description                                                           |
-| ----------------- | -------- | ---------------- | --------------------------------------------------------------------- |
-| backend           | False    | `syft`           | SBOM generation backend: `syft` or `cyclonedx`                        |
-| path_prefix       | False    | `.`              | Project directory; must resolve within the workspace                  |
-| sbom_format       | False    | `both`           | SBOM output format: `json`, `xml`, or `both`                          |
-| sbom_spec_version | False    | `1.5`            | CycloneDX specification version to use                                |
-| filename_prefix   | False    | `sbom-cyclonedx` | Base filename for SBOM output (without extension)                     |
-| output_directory  | False    | `.`              | SBOM report directory, within workspace or runner temp                |
-| include_dev       | False    | `false`          | Include development dependencies (Maven: test scope) in SBOM          |
-| fail_on_error     | False    | `true`           | Fail the action if SBOM generation encounters errors                  |
-| syft_version      | False    | `''`             | Syft version to download (defaults to the installer's pinned version) |
+| Name                    | Required | Default          | Description                                                           |
+| ----------------------- | -------- | ---------------- | --------------------------------------------------------------------- |
+| backend                 | False    | `syft`           | SBOM generation backend: `syft` or `cyclonedx`                        |
+| mode                    | False    | `directory`      | What to describe: `directory` (`path_prefix`) or `image`              |
+| path_prefix             | False    | `.`              | Project directory; must resolve within the workspace                  |
+| image_archive_directory | False    | `''`             | Image mode: directory of docker archives, one image per `*.tar` file  |
+| sbom_format             | False    | `both`           | SBOM output format: `json`, `xml`, or `both`                          |
+| sbom_spec_version       | False    | `1.5`            | CycloneDX specification version to use                                |
+| filename_prefix         | False    | `sbom-cyclonedx` | Base filename for SBOM output (without extension)                     |
+| output_directory        | False    | `.`              | SBOM report directory, within workspace or runner temp                |
+| include_dev             | False    | `false`          | Include development dependencies (Maven: test scope) in SBOM          |
+| fail_on_error           | False    | `true`           | Fail the action if SBOM generation encounters errors                  |
+| syft_version            | False    | `''`             | Syft version to download (defaults to the installer's pinned version) |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -517,20 +524,29 @@ rather than quiet successes.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name               | Description                                        |
-| ------------------ | -------------------------------------------------- |
-| sbom_json_path     | Path to generated JSON SBOM file                   |
-| sbom_xml_path      | Path to generated XML SBOM file                    |
-| component_count    | Number of components in the generated SBOM         |
-| backend            | SBOM generation backend used                       |
-| dependency_manager | Build tool the `cyclonedx` backend drove           |
-| skipped            | `true` when the action declined to generate        |
+| Name               | Description                                                     |
+| ------------------ | --------------------------------------------------------------- |
+| sbom_json_path     | Path to generated JSON SBOM file                                |
+| sbom_xml_path      | Path to generated XML SBOM file                                 |
+| component_count    | Number of components in the generated SBOM                      |
+| backend            | SBOM generation backend used                                    |
+| dependency_manager | Build tool the `cyclonedx` backend drove                        |
+| skipped            | `true` when the action declined to generate                     |
+| image_count        | Image mode: number of images described                          |
+| sboms_json         | Image mode: JSON array describing each image SBOM               |
+| manifest_path      | Image mode: path to the manifest file                           |
+| artifact_paths     | Image mode: newline-separated files written, manifest included  |
 
 <!-- markdownlint-enable MD013 -->
 
 The action emits `sbom_json_path` for the `json` and `both` formats,
 and `sbom_xml_path` for the `xml` and `both` formats; the output for a
 format the caller did not request stays empty.
+
+In image mode there is no single document, so `sbom_json_path` and
+`sbom_xml_path` stay empty and `component_count` reports the total
+across every image. The four image-mode outputs stay empty in directory
+mode. See [Container images](#container-images).
 
 `dependency_manager` reports the build system the `cyclonedx` backend
 drove, since the backend name identifies the tool rather than the build
@@ -559,12 +575,13 @@ than inferring it from empty build-tool metadata.
 
 ## Path Constraints
 
-Relative values for `path_prefix` and `output_directory` resolve
-against `GITHUB_WORKSPACE`, not the current working directory, so
-behaviour stays deterministic when a calling workflow sets a custom
-working directory. The action checks both directory inputs against
-the runner filesystem before use: `path_prefix` must resolve within
-`GITHUB_WORKSPACE`, and `output_directory` must resolve within
+Relative values for `path_prefix`, `image_archive_directory` and
+`output_directory` resolve against `GITHUB_WORKSPACE`, not the current
+working directory, so behaviour stays deterministic when a calling
+workflow sets a custom working directory. The action checks the
+directory inputs against the runner filesystem before use:
+`path_prefix` must resolve within `GITHUB_WORKSPACE`, and
+`image_archive_directory` and `output_directory` must resolve within
 `GITHUB_WORKSPACE` or `RUNNER_TEMP`. Paths that escape these
 locations fail the action, preventing scans or writes against
 arbitrary runner filesystem locations.
@@ -650,6 +667,185 @@ steps:
 
 <!-- markdownlint-enable MD046 -->
 
+## Container images
+
+`mode: image` writes one SBOM per container image, reading docker
+archives (`docker save` output) rather than a source tree. One
+document per image, because a single SBOM cannot describe more than
+one image, and a vulnerability finding has to name the image it
+affects.
+
+Image mode needs the `syft` backend, which is the default. Every
+other input keeps its meaning: `sbom_format`, `sbom_spec_version`,
+`filename_prefix`, `output_directory` and `fail_on_error` apply per
+image, and `path_prefix` plays no part.
+
+<!-- markdownlint-disable MD046 -->
+
+```yaml
+- name: "Download image archives"
+  uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+  with:
+    name: docker-archives
+    path: ${{ runner.temp }}/docker-archives
+
+- name: "Generate image SBOMs"
+  id: sbom
+  uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    mode: image
+    image_archive_directory: ${{ runner.temp }}/docker-archives
+    sbom_format: json
+
+- name: "Upload SBOM artifacts"
+  uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+  with:
+    name: sbom-files
+    path: ${{ steps.sbom.outputs.artifact_paths }}
+    if-no-files-found: error
+```
+
+<!-- markdownlint-enable MD046 -->
+
+### The archive contract
+
+The action scans every `*.tar` file directly inside
+`image_archive_directory`, dot-prefixed names included, in byte
+order. Each archive must hold
+**a single** image, which is what
+[docker-save-images-action](https://github.com/lfreleng-actions/docker-save-images-action)
+writes in `per-image` mode. That action names each archive after the
+image reference, with `/` and `:` mapped to `_`:
+`ghcr.io/org/app:1.2` becomes `ghcr.io_org_app_1.2.tar`.
+
+The archive's file name, minus `.tar`, is the image's **label**. Labels
+must fit `A-Z a-z 0-9 . _ @ -`. A reference that action saves fits
+that set unless its registry is an IPv6 address: the mapping leaves
+the brackets of `[2001:db8::1]:5000/app:1.2` in the archive name, so
+image mode refuses such archives. Push through a registry host name
+instead.
+
+The action checks each archive before scanning any of them, and fails
+regardless of `fail_on_error` when one breaks the contract:
+
+- an archive holding more than one image, which syft refuses to
+  scan;
+- a file that is not a complete docker archive: no `manifest.json`, or
+  one whose `Config` and `Layers` the archive does not contain;
+- a symbolic link, which could point the scan at any file on the
+  runner;
+- a label outside the character set above;
+- an image reference in the archive (every `RepoTags` entry, not the
+  first alone) that Docker's reference grammar rejects, such as
+  `:justtag`.
+
+These are configuration errors rather than generation errors: relaxing
+them would publish SBOMs describing the wrong thing. A directory
+holding no archives at all counts as a generation failure instead, and
+honours `fail_on_error`, since a build permitted to fail can
+legitimately leave nothing to scan.
+
+### Filenames and the manifest
+
+For each image the action writes `<filename_prefix>-<label>.json` (and
+`.xml` where requested) into `output_directory`. With the default
+prefix that is `sbom-cyclonedx-ghcr.io_org_app_1.2.json`, the name the
+docker-workflows lanes have always produced, so a scanner globbing
+`sbom-cyclonedx-*.json` finds every image document.
+
+Alongside them it writes `<filename_prefix>.manifest.json`, an array
+with one entry per image. The dot after the prefix keeps the manifest
+outside that `sbom-cyclonedx-*.json` glob. The `sboms_json` output
+carries the same array.
+
+```json
+[
+  {
+    "label": "ghcr.io_org_app_1.2",
+    "image": "ghcr.io/org/app:1.2",
+    "archive": "ghcr.io_org_app_1.2.tar",
+    "format": "cyclonedx",
+    "spec_version": "1.5",
+    "sbom_json": "sbom-cyclonedx-ghcr.io_org_app_1.2.json",
+    "sbom_xml": null,
+    "component_count": 94
+  }
+]
+```
+
+<!-- markdownlint-disable MD013 -->
+
+| Field             | Meaning                                                                       |
+| ----------------- | ----------------------------------------------------------------------------- |
+| `label`           | Archive file name minus `.tar`; the stable key in every filename              |
+| `image`           | Image reference recorded in the archive's `manifest.json`; `null` if untagged |
+| `archive`         | Archive file name                                                             |
+| `format`          | Document standard, always `cyclonedx` today                                   |
+| `spec_version`    | CycloneDX specification version of the documents                              |
+| `sbom_json`       | JSON document, relative to the manifest; `null` when not requested            |
+| `sbom_xml`        | XML document, relative to the manifest; `null` when not requested             |
+| `component_count` | Components in this image's document                                           |
+
+<!-- markdownlint-enable MD013 -->
+
+`image` comes from the archive itself, not from reversing the filename
+mapping, which cannot be undone: `a/b:1` and `a_b:1` both map to
+`a_b_1`. A consumer naming images in a report should read `image`
+rather than reconstruct it from a filename.
+
+Paths in the manifest are relative to the manifest's own directory, so
+it stays valid after an artifact upload and download. The
+`manifest_path` output gives its location in the generating job, and
+`artifact_paths` lists every file the run wrote, manifest included, for
+`actions/upload-artifact`. Uploading that list rather than a glob
+leaves out anything else sitting in the output directory.
+Upload-artifact reads each line as a glob pattern, so in image mode
+`output_directory`, once resolved, must not contain line breaks or any
+of `* ? [ ] \`; the action refuses it rather than list a path that
+would select other files. Upload-artifact also skips a file whose name
+starts with `.` unless the caller enables `include-hidden-files`, so
+image mode refuses a `filename_prefix` starting with `.`.
+
+Each document names the image as its subject
+(`metadata.component.name`). Left to itself syft would record the
+archive's path on the runner there instead.
+
+### Failure handling
+
+Each document passes the same verification as directory mode. Any
+failure fails the whole run, and the action removes every document and
+the manifest it wrote: a partial set would pass a downstream glob as a
+complete one. Under `fail_on_error: false` the step succeeds with
+`image_count` and `component_count` of `0` and `sboms_json` of `[]`.
+
+The action clears its destinations before generating, as in directory
+mode, with the same guard against removing files it cannot identify.
+It replaces a manifest when the file is a non-empty array whose
+entries carry the fields above and no others.
+It owns the names derived from the archives present and the manifest.
+A document left over from an image the current run does not include
+stays put, so point `output_directory` at a fresh directory, or upload
+`artifact_paths`, where earlier output might linger.
+
+### Specification version
+
+The action asks syft for the version in `sbom_spec_version` (default
+`1.5`). A bare `cyclonedx-json` output instead takes syft's own
+default, which moves with syft releases: syft 1.51.1, the version the
+pinned installer fetches, writes `1.7`. Set `sbom_spec_version` to
+match a consumer that needs a particular version.
+
+### Image references
+
+Image mode reads docker archives and nothing else. Pulling from a
+registry needs credentials and registry egress on every runner, and
+reading the Docker daemon works in the job that built the images and
+no other. The reusable workflows pass images between jobs as
+archives, which leaves neither source available to them. To scan a
+registry image directly,
+[grype-scan-action](https://github.com/lfreleng-actions/grype-scan-action)
+accepts a `registry:` target.
+
 ## Workflow Integration
 
 The reusable workflows in this organisation keep SBOM generation and
@@ -680,10 +876,10 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, and skips a Gradle version below the plugin's floor where the caller supplied one
+1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, and skips a Gradle version below the plugin's floor where the caller supplied one
 2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java`. The selected backend guards each step, so neither costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. In both cases the JSON document always gets generated internally to compute the component count
-4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. In both cases the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
+4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary; in image mode, the image count, manifest, its path, and the list of files written
 
 <!-- markdownlint-enable MD013 -->
 
@@ -711,6 +907,15 @@ would leave behind a document the caller did not request, which the
   `syft` backend will produce an SBOM for a Maven project, but one that
   omits transitive dependencies and reports BOM-managed versions as
   `UNKNOWN`
+- Image mode replaces the inline "Generate image SBOMs" step of the
+  docker-workflows build lanes. With `sbom_format: json` it writes the
+  same `sbom-cyclonedx-<label>.json` names, so the lanes' artifact and
+  Grype scan need no change. The documents differ from the inline
+  step's in timestamp, serial number and subject name, plus the
+  specification version unless `sbom_spec_version` is `1.7`
+- Image mode refuses archives outside the workspace and `RUNNER_TEMP`,
+  so a lane downloading archives to `/tmp` must move them under
+  `${{ runner.temp }}` first
 
 [pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/sbom-action/main
 [pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/sbom-action/main.svg
