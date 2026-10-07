@@ -250,6 +250,602 @@ jobs:
             echo "With development components: ${WITH_DEV_COUNT}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test image mode against real docker archives ###
+  # Image mode's filenames are a contract with the archive producer
+  # (docker-save-images-action, per-image mode) and the Grype job in
+  # docker-workflows, so this job uses the real producer and the same
+  # artifact round trip the lanes do, then holds the documents to the
+  # inline step image mode replaces. See
+  # lfreleng-actions/docker-workflows#35.
+  test-image-mode:
+    name: "Test: image mode"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Two images: an Alpine one with OS packages and an npm package,
+      # and a scratch one with the npm package alone. The references
+      # carry '/' and ':' so the producer's filename mapping is
+      # exercised. The base is pinned by index digest so the component
+      # set cannot drift under the test.
+      - name: "Build fixture images"
+        shell: bash
+        env:
+          # yamllint disable-line rule:line-length
+          BASE_IMAGE: 'alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc'
+        run: |
+          # Build fixture images
+          context="${RUNNER_TEMP}/image-fixture"
+          mkdir -p "${context}"
+          printf '%s\n' '{"name":"left-pad","version":"1.3.0"}' \
+            > "${context}/package.json"
+          {
+            echo "FROM ${BASE_IMAGE}"
+            echo 'COPY package.json /usr/lib/node_modules/left-pad/'
+          } > "${context}/Dockerfile"
+          {
+            echo 'FROM scratch'
+            echo 'COPY package.json /usr/lib/node_modules/left-pad/'
+          } > "${context}/Dockerfile.scratch"
+          docker build -q -t sbom-action-test/fixture:ci "${context}"
+          docker build -q -t sbom-action-test-scratch:ci \
+            -f "${context}/Dockerfile.scratch" "${context}"
+          # A combined archive breaks the one-image rule, for the
+          # failure case below
+          mkdir -p "${RUNNER_TEMP}/combined"
+          docker save sbom-action-test/fixture:ci \
+            sbom-action-test-scratch:ci \
+            -o "${RUNNER_TEMP}/combined/both.tar"
+          mkdir -p "${RUNNER_TEMP}/empty"
+          # One directory per remaining contract breach, each built
+          # from an otherwise valid single-image archive
+          single="${RUNNER_TEMP}/single.tar"
+          docker save sbom-action-test-scratch:ci -o "${single}"
+          mkdir -p "${RUNNER_TEMP}/bad-label" "${RUNNER_TEMP}/bad-link" \
+            "${RUNNER_TEMP}/bad-archive" "${RUNNER_TEMP}/bad-ref"
+          cp "${single}" "${RUNNER_TEMP}/bad-label/bad+label.tar"
+          mkdir -p "${RUNNER_TEMP}/dot-archive"
+          cp "${single}" "${RUNNER_TEMP}/dot-archive/.dotted.tar"
+          ln -s "${single}" "${RUNNER_TEMP}/bad-link/link.tar"
+          tar -cf "${RUNNER_TEMP}/bad-archive/plain.tar" \
+            -C "${context}" package.json
+          unpacked="${RUNNER_TEMP}/bad-ref-unpacked"
+          mkdir -p "${unpacked}"
+          tar -xf "${single}" -C "${unpacked}"
+          jq '.[0].RepoTags = ["bad ref;x:1"]' "${unpacked}/manifest.json" \
+            > "${RUNNER_TEMP}/bad-ref-manifest.json"
+          mv "${RUNNER_TEMP}/bad-ref-manifest.json" \
+            "${unpacked}/manifest.json"
+          # Members named without a leading ./, as docker save writes
+          (cd "${unpacked}" && tar -cf "${RUNNER_TEMP}/bad-ref/ref.tar" -- *)
+          # Plain characters only, but no repository name: Docker's
+          # reference grammar rejects it
+          mkdir -p "${RUNNER_TEMP}/bad-grammar"
+          jq '.[0].RepoTags = [":justtag"]' "${unpacked}/manifest.json" \
+            > "${RUNNER_TEMP}/bad-grammar-manifest.json"
+          mv "${RUNNER_TEMP}/bad-grammar-manifest.json" \
+            "${unpacked}/manifest.json"
+          (cd "${unpacked}" && \
+            tar -cf "${RUNNER_TEMP}/bad-grammar/grammar.tar" -- *)
+          # A valid first tag must not hide an invalid second one
+          mkdir -p "${RUNNER_TEMP}/bad-tags"
+          jq '.[0].RepoTags = ["sbom-action-test-scratch:ci", ":bad"]' \
+            "${unpacked}/manifest.json" \
+            > "${RUNNER_TEMP}/bad-tags-manifest.json"
+          mv "${RUNNER_TEMP}/bad-tags-manifest.json" \
+            "${unpacked}/manifest.json"
+          (cd "${unpacked}" && \
+            tar -cf "${RUNNER_TEMP}/bad-tags/tags.tar" -- *)
+          # A manifest naming a config the archive does not hold
+          mkdir -p "${RUNNER_TEMP}/bad-structure"
+          jq '.[0].RepoTags = ["sbom-action-test-scratch:ci"]
+            | .[0].Config = "missing.json"' \
+            "${unpacked}/manifest.json" \
+            > "${RUNNER_TEMP}/bad-structure-manifest.json"
+          mv "${RUNNER_TEMP}/bad-structure-manifest.json" \
+            "${unpacked}/manifest.json"
+          (cd "${unpacked}" && \
+            tar -cf "${RUNNER_TEMP}/bad-structure/structure.tar" -- *)
+          # A file at the manifest destination that is not this
+          # action's manifest: an empty array, and an array that
+          # merely names a label and an archive
+          mkdir -p sbom-guard-empty sbom-guard-lookalike
+          echo '[]' > sbom-guard-empty/sbom-cyclonedx.manifest.json
+          echo '[{"label":"x","archive":"x.tar"}]' \
+            > sbom-guard-lookalike/sbom-cyclonedx.manifest.json
+
+      - name: "Save images with docker-save-images-action"
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/docker-save-images-action@fd148182fc22be846b343f92404f4104d8d049f1 # v0.2.0
+        with:
+          # yamllint disable-line rule:line-length
+          docker-artifacts-to-save: 'sbom-action-test/fixture:ci sbom-action-test-scratch:ci'
+          mode: 'per-image'
+          artifact-name: 'sbom-action-image-archives'
+          output-directory: 'docker-archives'
+          retention-days: '1'
+
+      # The lanes download the archives in a separate job, so the test
+      # does too, landing them under RUNNER_TEMP outside the checkout
+      - name: "Download the archives as a lane would"
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: 'sbom-action-image-archives'
+          path: ${{ runner.temp }}/docker-archives
+
+      - name: "Running local action: image mode, as the lanes use it"
+        id: image
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          sbom_format: json
+          output_directory: sbom-lane
+
+      - name: "Running local action: image mode, both formats"
+        id: image-both
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          filename_prefix: image-sbom
+          output_directory: ${{ runner.temp }}/sbom-both
+
+      - name: "Running local action: combined archive"
+        id: image-combined
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/combined
+          output_directory: sbom-combined
+
+      - name: "Running local action: no archives (hard fail)"
+        id: image-empty-hard
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/empty
+          output_directory: sbom-empty
+
+      - name: "Running local action: no archives (soft fail)"
+        id: image-empty-soft
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/empty
+          output_directory: sbom-empty
+          fail_on_error: 'false'
+
+      # Contract breaches fail regardless of fail_on_error, so each
+      # runs with it relaxed
+      - name: "Running local action: unsafe archive name"
+        id: image-bad-label
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-label
+          output_directory: sbom-bad-label
+          fail_on_error: 'false'
+
+      - name: "Running local action: symlinked archive"
+        id: image-bad-link
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-link
+          output_directory: sbom-bad-link
+          fail_on_error: 'false'
+
+      - name: "Running local action: not a docker archive"
+        id: image-bad-archive
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-archive
+          output_directory: sbom-bad-archive
+          fail_on_error: 'false'
+
+      - name: "Running local action: malformed image reference"
+        id: image-bad-ref
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-ref
+          output_directory: sbom-bad-ref
+          fail_on_error: 'false'
+
+      - name: "Running local action: reference outside the grammar"
+        id: image-bad-grammar
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-grammar
+          output_directory: sbom-bad-grammar
+          fail_on_error: 'false'
+
+      - name: "Running local action: invalid second tag"
+        id: image-bad-tags
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-tags
+          output_directory: sbom-bad-tags
+          fail_on_error: 'false'
+
+      - name: "Running local action: incomplete docker archive"
+        id: image-bad-structure
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/bad-structure
+          output_directory: sbom-bad-structure
+          fail_on_error: 'false'
+
+      # Every *.tar counts, dot-prefixed names included
+      - name: "Running local action: dot-prefixed archive"
+        id: image-dot-archive
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/dot-archive
+          sbom_format: json
+          output_directory: sbom-dot
+
+      - name: "Running local action: combined archive (soft fail)"
+        id: image-combined-soft
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/combined
+          output_directory: sbom-combined
+          fail_on_error: 'false'
+
+      # artifact_paths lines are upload-artifact globs
+      - name: "Running local action: glob syntax in output directory"
+        id: image-glob-output
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          output_directory: sbom-[glob]
+
+      # upload-artifact skips hidden files by default
+      - name: "Running local action: hidden filename prefix"
+        id: image-hidden-prefix
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          filename_prefix: .sbom
+          output_directory: sbom-hidden
+
+      - name: "Running local action: empty array at the manifest path"
+        id: image-guard-empty
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          output_directory: sbom-guard-empty
+
+      - name: "Running local action: lookalike at the manifest path"
+        id: image-guard-lookalike
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          output_directory: sbom-guard-lookalike
+
+      # Image mode never reads path_prefix, so a missing one is no
+      # error; and a second run must recognise and replace its own
+      # manifest and documents
+      - name: "Running local action: image mode again, stale path_prefix"
+        id: image-rerun
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: ${{ runner.temp }}/docker-archives
+          sbom_format: json
+          output_directory: sbom-lane
+          path_prefix: no-such-directory
+
+      # The reference image mode replaces: the docker-workflows lanes'
+      # inline step, reduced to its scan. Same pinned installer, so the
+      # same syft.
+      - name: "Install syft for the inline reference"
+        id: syft
+        # yamllint disable-line rule:line-length
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+
+      - name: "Generate the inline reference SBOMs"
+        shell: bash
+        env:
+          SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        run: |
+          # Generate the inline reference SBOMs
+          mkdir -p sbom-inline
+          for archive in "${RUNNER_TEMP}"/docker-archives/*.tar; do
+            base=$(basename "${archive}" .tar)
+            "${SYFT_CMD}" scan "docker-archive:${archive}" -q \
+              -o "cyclonedx-json=sbom-inline/sbom-cyclonedx-${base}.json"
+          done
+
+      - name: "Verify the image mode contract"
+        shell: bash
+        env:
+          IMAGE_COUNT: ${{ steps.image.outputs.image_count }}
+          COMPONENT_COUNT: ${{ steps.image.outputs.component_count }}
+          SBOMS_JSON: ${{ steps.image.outputs.sboms_json }}
+          MANIFEST_PATH: ${{ steps.image.outputs.manifest_path }}
+          ARTIFACT_PATHS: ${{ steps.image.outputs.artifact_paths }}
+          SBOM_JSON_PATH: ${{ steps.image.outputs.sbom_json_path }}
+          SKIPPED: ${{ steps.image.outputs.skipped }}
+          BOTH_SBOMS_JSON: ${{ steps.image-both.outputs.sboms_json }}
+          # yamllint disable-line rule:line-length
+          BOTH_MANIFEST_PATH: ${{ steps.image-both.outputs.manifest_path }}
+          COMBINED_OUTCOME: ${{ steps.image-combined.outcome }}
+          EMPTY_HARD_OUTCOME: ${{ steps.image-empty-hard.outcome }}
+          EMPTY_SOFT_OUTCOME: ${{ steps.image-empty-soft.outcome }}
+          # yamllint disable-line rule:line-length
+          EMPTY_SOFT_IMAGES: ${{ steps.image-empty-soft.outputs.image_count }}
+          # yamllint disable-line rule:line-length
+          EMPTY_SOFT_SBOMS: ${{ steps.image-empty-soft.outputs.sboms_json }}
+          BAD_LABEL_OUTCOME: ${{ steps.image-bad-label.outcome }}
+          BAD_LINK_OUTCOME: ${{ steps.image-bad-link.outcome }}
+          BAD_ARCHIVE_OUTCOME: ${{ steps.image-bad-archive.outcome }}
+          BAD_REF_OUTCOME: ${{ steps.image-bad-ref.outcome }}
+          BAD_GRAMMAR_OUTCOME: ${{ steps.image-bad-grammar.outcome }}
+          BAD_TAGS_OUTCOME: ${{ steps.image-bad-tags.outcome }}
+          # yamllint disable-line rule:line-length
+          BAD_STRUCTURE_OUTCOME: ${{ steps.image-bad-structure.outcome }}
+          # yamllint disable-line rule:line-length
+          COMBINED_SOFT_OUTCOME: ${{ steps.image-combined-soft.outcome }}
+          GLOB_OUTPUT_OUTCOME: ${{ steps.image-glob-output.outcome }}
+          HIDDEN_PREFIX_OUTCOME: ${{ steps.image-hidden-prefix.outcome }}
+          DOT_IMAGES: ${{ steps.image-dot-archive.outputs.image_count }}
+          GUARD_EMPTY_OUTCOME: ${{ steps.image-guard-empty.outcome }}
+          # yamllint disable-line rule:line-length
+          GUARD_LOOKALIKE_OUTCOME: ${{ steps.image-guard-lookalike.outcome }}
+          RERUN_OUTCOME: ${{ steps.image-rerun.outcome }}
+          RERUN_SBOMS_JSON: ${{ steps.image-rerun.outputs.sboms_json }}
+        run: |
+          # Verify the image mode contract
+          errors=0
+          fail() {
+            echo "$1 ❌"
+            errors=1
+          }
+          lane="${GITHUB_WORKSPACE}/sbom-lane"
+          fixture="sbom-action-test_fixture_ci"
+          scratch="sbom-action-test-scratch_ci"
+
+          [ "${IMAGE_COUNT}" = "2" ] || \
+            fail "image_count was '${IMAGE_COUNT}', wanted 2"
+          [ "${SKIPPED}" = "false" ] || fail "skipped was '${SKIPPED}'"
+          # There is no single document in image mode
+          [ -z "${SBOM_JSON_PATH}" ] || fail "sbom_json_path was set"
+          [ "${MANIFEST_PATH}" = "${lane}/sbom-cyclonedx.manifest.json" ] \
+            || fail "manifest_path was '${MANIFEST_PATH}'"
+          [ "$(jq -c . "${MANIFEST_PATH}")" = "${SBOMS_JSON}" ] || \
+            fail "sboms_json differs from the manifest file"
+
+          # The filenames the lanes and their Grype job depend on:
+          # sbom-cyclonedx-<archive basename>.json, and nothing else
+          # matching the glob the Grype job scans
+          expected="sbom-cyclonedx-${scratch}.json"
+          expected="${expected} sbom-cyclonedx-${fixture}.json"
+          actual="$(cd "${lane}" && echo sbom-cyclonedx-*.json)"
+          [ "${actual}" = "${expected}" ] || \
+            fail "glob matched '${actual}', wanted '${expected}'"
+          [ ! -e "${lane}/sbom-cyclonedx.json" ] || \
+            fail "image mode wrote the directory-mode document"
+
+          # One manifest entry per archive, in byte order, naming the
+          # image recorded in the archive rather than one inferred
+          # from the filename
+          want="$(jq -nc --arg f "${fixture}" --arg s "${scratch}" '[
+            {label: $s, image: "sbom-action-test-scratch:ci",
+             archive: ($s + ".tar"),
+             sbom_json: ("sbom-cyclonedx-" + $s + ".json")},
+            {label: $f, image: "sbom-action-test/fixture:ci",
+             archive: ($f + ".tar"),
+             sbom_json: ("sbom-cyclonedx-" + $f + ".json")}]')"
+          got="$(jq -c '[.[] | {label, image, archive, sbom_json}]' \
+            "${MANIFEST_PATH}")"
+          [ "${got}" = "${want}" ] || fail "manifest was ${got}"
+          jq -e 'all(.[]; .format == "cyclonedx"
+            and .spec_version == "1.5" and .sbom_xml == null)' \
+            "${MANIFEST_PATH}" > /dev/null || \
+            fail "manifest format fields are wrong"
+
+          total=0
+          while IFS=$'\t' read -r label image sbom count; do
+            doc="${lane}/${sbom}"
+            [ -f "${doc}" ] || { fail "${label}: ${sbom} missing"; continue; }
+            [ "$(jq '.components | length' "${doc}")" = "${count}" ] || \
+              fail "${label}: component_count disagrees with the document"
+            [ "$(jq -r .specVersion "${doc}")" = "1.5" ] || \
+              fail "${label}: wrong specVersion"
+            # The document names the image, not the runner path
+            [ "$(jq -r .metadata.component.name "${doc}")" = "${image}" ] \
+              || fail "${label}: metadata.component.name is not ${image}"
+            grep -qxF "${doc}" <<< "${ARTIFACT_PATHS}" || \
+              fail "${label}: missing from artifact_paths"
+            total=$((total + count))
+          done < <(jq -r '.[] | [.label, .image, .sbom_json,
+            .component_count] | @tsv' "${MANIFEST_PATH}")
+          [ "${total}" = "${COMPONENT_COUNT}" ] || \
+            fail "component_count ${COMPONENT_COUNT} is not the sum ${total}"
+          grep -qxF "${MANIFEST_PATH}" <<< "${ARTIFACT_PATHS}" || \
+            fail "artifact_paths omits the manifest"
+          [ "$(grep -c . <<< "${ARTIFACT_PATHS}")" = "3" ] || \
+            fail "artifact_paths does not list exactly three files"
+          # The fixture image carries OS packages and the npm package
+          jq -e '[.components[].name] | index("left-pad") and
+            index("alpine-baselayout")' \
+            "${lane}/sbom-cyclonedx-${fixture}.json" > /dev/null || \
+            fail "fixture SBOM lacks the expected components"
+
+          # Equivalence with the inline step it replaces: the same
+          # components and dependency graph. Spec version and
+          # document metadata differ by design. bom-refs are opaque
+          # IDs, so the graph is compared with each one replaced by
+          # the identity of the component it names (the document's
+          # subject standing in as a fixed token) and edges sorted.
+          ident='[.components[] | [.type, .name, (.version // ""),
+            (.purl // "")] | join("|")] | sort'
+          # jq variables, not shell ones
+          # shellcheck disable=SC2016
+          graph='def id: [.type, .name, (.version // ""), (.purl // "")]
+              | join("|");
+            (reduce (.components // [])[] as $c ({};
+                .[$c["bom-ref"]] = ($c | id))
+              + {(.metadata.component["bom-ref"] // ""): "(subject)"})
+            as $names
+            | [(.dependencies // [])[]
+                | {ref: ($names[.ref] // .ref),
+                   dependsOn: ([(.dependsOn // [])[]
+                     | ($names[.] // .)] | sort)}]
+            | sort'
+          for label in "${fixture}" "${scratch}"; do
+            new="${lane}/sbom-cyclonedx-${label}.json"
+            old="sbom-inline/sbom-cyclonedx-${label}.json"
+            [ "$(jq -c "${ident}" "${new}")" = \
+              "$(jq -c "${ident}" "${old}")" ] || \
+              fail "${label}: components differ from the inline step"
+            [ "$(jq -c "${graph}" "${new}")" = \
+              "$(jq -c "${graph}" "${old}")" ] || \
+              fail "${label}: dependency graph differs from the inline step"
+          done
+          # Non-vacuous: the fixture's graph has edges to compare
+          jq -e '[.dependencies[]?.dependsOn[]?] | length > 0' \
+            "${lane}/sbom-cyclonedx-${fixture}.json" > /dev/null || \
+            fail "fixture SBOM has no dependency edges to compare"
+
+          # Both formats, custom prefix, output under RUNNER_TEMP
+          jq -e 'length == 2 and all(.[];
+            (.sbom_json | startswith("image-sbom-"))
+            and (.sbom_xml | endswith(".xml")))' \
+            <<< "${BOTH_SBOMS_JSON}" > /dev/null || \
+            fail "both-format manifest is wrong: ${BOTH_SBOMS_JSON}"
+          both_dir="$(dirname "${BOTH_MANIFEST_PATH}")"
+          [ "${BOTH_MANIFEST_PATH}" = \
+            "${both_dir}/image-sbom.manifest.json" ] || \
+            fail "both-format manifest path is wrong"
+          while IFS= read -r xml; do
+            grep -q 'cyclonedx.org/schema/bom/1.5' "${both_dir}/${xml}" \
+              || fail "${xml} is not a CycloneDX 1.5 XML document"
+          done < <(jq -r '.[].sbom_xml' <<< "${BOTH_SBOMS_JSON}")
+
+          # A combined archive must be refused, not described
+          [ "${COMBINED_OUTCOME}" = "failure" ] || \
+            fail "a combined archive was accepted"
+          [ -z "$(ls -A sbom-combined 2> /dev/null)" ] || \
+            fail "a combined archive left documents behind"
+          # No archives is a generation failure honouring fail_on_error
+          [ "${EMPTY_HARD_OUTCOME}" = "failure" ] || \
+            fail "no archives did not fail"
+          [ "${EMPTY_SOFT_OUTCOME}" = "success" ] || \
+            fail "no archives ignored fail_on_error: false"
+          if [ "${EMPTY_SOFT_IMAGES}" != "0" ] || \
+            [ "${EMPTY_SOFT_SBOMS}" != "[]" ]; then
+            fail "soft failure reported '${EMPTY_SOFT_IMAGES}' images"
+          fi
+
+          # Contract breaches fail even under fail_on_error: false,
+          # and write nothing
+          for case_outcome in \
+            "bad-label:${BAD_LABEL_OUTCOME}" \
+            "bad-link:${BAD_LINK_OUTCOME}" \
+            "bad-archive:${BAD_ARCHIVE_OUTCOME}" \
+            "bad-ref:${BAD_REF_OUTCOME}" \
+            "bad-grammar:${BAD_GRAMMAR_OUTCOME}" \
+            "bad-tags:${BAD_TAGS_OUTCOME}" \
+            "bad-structure:${BAD_STRUCTURE_OUTCOME}" \
+            "combined:${COMBINED_SOFT_OUTCOME}"; do
+            name="${case_outcome%%:*}"
+            [ "${case_outcome#*:}" = "failure" ] || \
+              fail "${name}: accepted under fail_on_error: false"
+            [ -z "$(ls -A "sbom-${name}" 2> /dev/null)" ] || \
+              fail "${name}: left files behind"
+          done
+          # artifact_paths cannot carry glob syntax
+          [ "${GLOB_OUTPUT_OUTCOME}" = "failure" ] || \
+            fail "an output directory with glob syntax was accepted"
+          [ "${HIDDEN_PREFIX_OUTCOME}" = "failure" ] || \
+            fail "a hidden filename prefix was accepted"
+          [ -z "$(ls -A sbom-hidden 2> /dev/null)" ] || \
+            fail "a hidden filename prefix left files behind"
+          if [ "${DOT_IMAGES}" != "1" ] || \
+            [ ! -f sbom-dot/sbom-cyclonedx-.dotted.json ]; then
+            fail "a dot-prefixed archive was not scanned"
+          fi
+          # A file at the manifest path that this action did not write
+          # is refused and survives
+          [ "${GUARD_EMPTY_OUTCOME}" = "failure" ] || \
+            fail "an empty array at the manifest path was replaced"
+          [ "$(cat sbom-guard-empty/sbom-cyclonedx.manifest.json)" = \
+            "[]" ] || fail "the empty-array manifest lookalike changed"
+          [ "${GUARD_LOOKALIKE_OUTCOME}" = "failure" ] || \
+            fail "a manifest lookalike was replaced"
+          jq -e '. == [{"label":"x","archive":"x.tar"}]' \
+            sbom-guard-lookalike/sbom-cyclonedx.manifest.json \
+            > /dev/null || fail "the manifest lookalike changed"
+          # Its own manifest is recognised and replaced, and path_prefix
+          # plays no part
+          [ "${RERUN_OUTCOME}" = "success" ] || \
+            fail "a rerun over its own output, path_prefix stale, failed"
+          [ "${RERUN_SBOMS_JSON}" = "${SBOMS_JSON}" ] || \
+            fail "the rerun manifest differs from the first run"
+          ! compgen -G "${lane}/.[!.]*" > /dev/null || \
+            fail "a temporary manifest was left in the output directory"
+
+          if [ "${errors}" != "0" ]; then
+            echo "Image mode verification failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Image mode contract verified: ${IMAGE_COUNT} images," \
+            "${COMPONENT_COUNT} components ✅" | tee -a "$GITHUB_STEP_SUMMARY"
+
   ### Test the cyclonedx backend resolves a real dependency graph ###
   # The syft backend reads pom.xml as text, which for Maven is an input
   # to dependency resolution rather than a product of it: transitive
@@ -881,6 +1477,47 @@ jobs:
         with:
           filename_prefix: '../escape'
 
+      # Image mode's own inputs. The archive directory is required in
+      # that mode and refused outside it, so a forgotten mode cannot
+      # quietly produce an SBOM of the workspace instead.
+      - name: "Running local action with unsupported mode"
+        id: bad-mode
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: layers
+
+      - name: "Running local action with image mode and no archives"
+        id: image-no-directory
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+
+      - name: "Running local action with an archive directory alone"
+        id: directory-with-archives
+        continue-on-error: true
+        uses: $/
+        with:
+          image_archive_directory: '.'
+
+      - name: "Running local action with image mode on cyclonedx"
+        id: image-cyclonedx
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          backend: cyclonedx
+          image_archive_directory: '.'
+
+      - name: "Running local action with escaping archive directory"
+        id: image-escape
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: image
+          image_archive_directory: /etc
+
       # The cyclonedx-backend inputs feed a Maven goal coordinate and
       # a setup-java invocation, so they get validated on every run
       # rather than only when that backend is selected
@@ -1261,6 +1898,12 @@ jobs:
           ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
           OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
           PREFIX_OUTCOME: ${{ steps.bad-prefix.outcome }}
+          MODE_OUTCOME: ${{ steps.bad-mode.outcome }}
+          IMAGE_NO_DIR_OUTCOME: ${{ steps.image-no-directory.outcome }}
+          # yamllint disable-line rule:line-length
+          DIR_WITH_ARCHIVES_OUTCOME: ${{ steps.directory-with-archives.outcome }}
+          IMAGE_CYCLONEDX_OUTCOME: ${{ steps.image-cyclonedx.outcome }}
+          IMAGE_ESCAPE_OUTCOME: ${{ steps.image-escape.outcome }}
           JAVA_VERSION_OUTCOME: ${{ steps.bad-java-version.outcome }}
           # yamllint disable-line rule:line-length
           JAVA_DISTRIBUTION_OUTCOME: ${{ steps.bad-java-distribution.outcome }}
@@ -1303,6 +1946,11 @@ jobs:
             "escape:${ESCAPE_OUTCOME}" \
             "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
             "prefix:${PREFIX_OUTCOME}" \
+            "mode:${MODE_OUTCOME}" \
+            "image-no-directory:${IMAGE_NO_DIR_OUTCOME}" \
+            "directory-with-archives:${DIR_WITH_ARCHIVES_OUTCOME}" \
+            "image-cyclonedx:${IMAGE_CYCLONEDX_OUTCOME}" \
+            "image-escape:${IMAGE_ESCAPE_OUTCOME}" \
             "java-version:${JAVA_VERSION_OUTCOME}" \
             "java-distribution:${JAVA_DISTRIBUTION_OUTCOME}" \
             "plugin-version:${PLUGIN_VERSION_OUTCOME}" \
