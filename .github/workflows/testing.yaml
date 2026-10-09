@@ -1405,6 +1405,466 @@ jobs:
             echo "With test configurations: ${DEV_COUNT}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test the cyclonedx backend against Cargo ###
+  # Syft reads Cargo.lock and lists every locked crate, whatever needs
+  # it, with no scope and no dependency graph. cargo-cyclonedx reads
+  # cargo's own resolution instead. See lfreleng-actions/sbom-action#51.
+  test-cyclonedx-cargo:
+    name: "Test: cyclonedx backend (Cargo)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          # v0.16.6 rather than the v0.16.1 the other jobs load: it
+          # adds index.crates.io and static.crates.io, which cargo
+          # metadata reads dependency manifests from
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf' # v0.16.6
+
+      # Block, like every other job here: cargo runs a rustc wrapper
+      # from the checkout, which one fixture below does on purpose.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A commit on main, not a tag: no release carries variants/ yet.
+      # The root crate has no dependencies; variants/dependencies
+      # locks semver from crates.io; variants/workspace is a virtual
+      # workspace whose cli member depends on core, and core on support
+      # as a dev-dependency only.
+      - name: "Checkout test project: lfreleng-actions/test-rust-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-rust-project
+          # yamllint disable-line rule:line-length
+          ref: 37adc93cbaec02ec641db12f91c9f4d567cac554 # main, after v0.0.3
+          path: test-project
+          persist-credentials: false
+
+      - name: "Derive Cargo fixtures"
+        shell: bash
+        run: |
+          # Derive Cargo fixtures
+          set -euo pipefail
+          # Each copy keeps variants/dependencies' Cargo.lock as it is.
+          # A lockfile records a package's dependencies without their
+          # kind or platform, so moving semver to another table leaves
+          # it current for --locked and nothing resolves afresh.
+          src=test-project/variants/dependencies
+          mkdir -p cargo-fixtures
+          derive() {
+            cp -R "${src}" "cargo-fixtures/$1"
+            sed -i "s/^\[dependencies\]$/$2/" "cargo-fixtures/$1/Cargo.toml"
+          }
+          derive build-only '[build-dependencies]'
+          derive dev-only '[dev-dependencies]'
+          derive windows-only "[target.'cfg(windows)'.dependencies]"
+
+          # Stale: a dependency the lockfile does not record
+          cp -R "${src}" cargo-fixtures/stale
+          printf 'itoa = "1"\n' >> cargo-fixtures/stale/Cargo.toml
+          cp cargo-fixtures/stale/Cargo.lock cargo-fixtures/stale.lock
+
+          # Spy: a rustc wrapper from the checkout, which cargo
+          # executes, records the environment it runs with. The single
+          # quotes are deliberate: the wrapper expands them, not this step.
+          cp -R "${src}" cargo-fixtures/spy
+          mkdir -p cargo-fixtures/spy/.cargo
+          # shellcheck disable=SC2016
+          printf '%s\n' '#!/bin/sh' \
+            'env >> "$(dirname "$0")/spy-env.txt"' 'exec "$@"' \
+            > cargo-fixtures/spy/spy.sh
+          chmod +x cargo-fixtures/spy/spy.sh
+          printf '[build]\nrustc-wrapper = "./spy.sh"\n' \
+            > cargo-fixtures/spy/.cargo/config.toml
+
+      # untrusted_checkout is 'false' throughout for the reason the
+      # Maven job gives: the trees scanned are a pinned org-owned
+      # commit and copies of it, not the pull request's own content.
+      - name: "Running local action: Cargo, single crate"
+        id: crate
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project
+          sbom_format: json
+          filename_prefix: sbom-crate
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, crates.io dependency"
+        id: deps
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project/variants/dependencies
+          sbom_format: both
+          filename_prefix: sbom-deps
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, workspace"
+        id: workspace
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          dependency_manager: cargo
+          path_prefix: test-project/variants/workspace
+          sbom_format: json
+          filename_prefix: sbom-workspace
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, one workspace member"
+        id: member
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project/variants/workspace/cli
+          sbom_format: json
+          filename_prefix: sbom-member
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, workspace as XML only"
+        id: workspace-xml
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project/variants/workspace
+          sbom_format: xml
+          filename_prefix: sbom-workspace
+          output_directory: cargo-xml-out
+
+      - name: "Running local action: Cargo, build-dependency"
+        id: build
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/build-only
+          sbom_format: json
+          filename_prefix: sbom-build
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, build-dependency, include_dev"
+        id: build-dev
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/build-only
+          sbom_format: json
+          filename_prefix: sbom-build-dev
+          output_directory: cargo-out
+          include_dev: 'true'
+
+      - name: "Running local action: Cargo, dev-dependency, include_dev"
+        id: dev-dev
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/dev-only
+          sbom_format: json
+          filename_prefix: sbom-dev-dev
+          output_directory: cargo-out
+          include_dev: 'true'
+
+      # The runner is Linux, so only --target all can see a
+      # Windows-only dependency. CARGO_BUILD_TARGET would override
+      # that inside cargo-cyclonedx; the action removes it.
+      - name: "Running local action: Cargo, every target"
+        id: target-all
+        uses: $/
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/windows-only
+          sbom_format: json
+          filename_prefix: sbom-target-all
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, one target"
+        id: target-linux
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/windows-only
+          sbom_format: json
+          filename_prefix: sbom-target-linux
+          output_directory: cargo-out
+          cargo_target: x86_64-unknown-linux-gnu
+
+      - name: "Running local action: Cargo, no lockfile"
+        id: no-lockfile
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project/variants/no-lockfile
+          sbom_format: json
+          filename_prefix: sbom-no-lockfile
+          output_directory: cargo-out
+
+      # Placeholder values, present so the spy can prove their absence
+      - name: "Running local action: Cargo, environment scrub"
+        id: spy
+        uses: $/
+        env:
+          CARGO_REGISTRY_TOKEN: placeholder
+          CARGO_REGISTRIES_PRIVATE_TOKEN: placeholder
+          CARGO_REGISTRIES_PRIVATE_INDEX: sparse+https://example.invalid/
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: placeholder
+          ACTIONS_ID_TOKEN_REQUEST_URL: https://example.invalid/
+          ACTIONS_RUNTIME_TOKEN: placeholder
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/spy
+          sbom_format: json
+          filename_prefix: sbom-spy
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, stale lockfile"
+        id: stale
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-fixtures/stale
+          filename_prefix: sbom-stale
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, unsupported spec version"
+        id: spec
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: test-project/variants/dependencies
+          sbom_spec_version: '1.6'
+          filename_prefix: sbom-spec
+          output_directory: cargo-out
+
+      - name: "Running local action: Cargo, untrusted checkout"
+        id: untrusted
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'true'
+          path_prefix: test-project
+          filename_prefix: sbom-untrusted
+          output_directory: cargo-out
+
+      - name: "Verify the Cargo dependency graphs"
+        shell: bash
+        env:
+          CRATE_JSON: ${{ steps.crate.outputs.sbom_json_path }}
+          CRATE_MANAGER: ${{ steps.crate.outputs.dependency_manager }}
+          CRATE_COUNT: ${{ steps.crate.outputs.component_count }}
+          DEPS_JSON: ${{ steps.deps.outputs.sbom_json_path }}
+          DEPS_XML: ${{ steps.deps.outputs.sbom_xml_path }}
+          WS_JSON: ${{ steps.workspace.outputs.sbom_json_path }}
+          WS_COUNT: ${{ steps.workspace.outputs.component_count }}
+          MEMBER_JSON: ${{ steps.member.outputs.sbom_json_path }}
+          WS_XML: ${{ steps.workspace-xml.outputs.sbom_xml_path }}
+          WS_XML_JSON: ${{ steps.workspace-xml.outputs.sbom_json_path }}
+          BUILD_JSON: ${{ steps.build.outputs.sbom_json_path }}
+          BUILD_DEV_JSON: ${{ steps.build-dev.outputs.sbom_json_path }}
+          DEV_DEV_JSON: ${{ steps.dev-dev.outputs.sbom_json_path }}
+          ALL_JSON: ${{ steps.target-all.outputs.sbom_json_path }}
+          LINUX_JSON: ${{ steps.target-linux.outputs.sbom_json_path }}
+          NO_LOCK_JSON: ${{ steps.no-lockfile.outputs.sbom_json_path }}
+          SPY_JSON: ${{ steps.spy.outputs.sbom_json_path }}
+          STALE_OUTCOME: ${{ steps.stale.outcome }}
+          SPEC_OUTCOME: ${{ steps.spec.outcome }}
+          UNTRUSTED_SKIPPED: ${{ steps.untrusted.outputs.skipped }}
+        run: |
+          # Verify the Cargo dependency graphs
+          failures=0
+          fail() {
+            echo "$* ❌"
+            failures=$((failures + 1))
+          }
+          # The names of the components a document lists, one per line,
+          # as "name:scope" ("-" for none)
+          components() {
+            jq -r '.components[]? | "\(.name):\(.scope // "-")"' "$1"
+          }
+          # The dependsOn list of the component called $2, by name
+          depends_on() {
+            jq -r --arg name "$2" '
+              ([.metadata.component] + .components) as $all
+              | ($all[] | select(.name == $name) | .["bom-ref"]) as $ref
+              | .dependencies[] | select(.ref == $ref)
+              | .dependsOn[]? as $d | $all[]
+              | select(.["bom-ref"] == $d) | .name' "$1"
+          }
+
+          for doc in "${CRATE_JSON}" "${DEPS_JSON}" "${WS_JSON}" \
+            "${MEMBER_JSON}" "${BUILD_JSON}" "${BUILD_DEV_JSON}" \
+            "${DEV_DEV_JSON}" "${ALL_JSON}" "${LINUX_JSON}" \
+            "${NO_LOCK_JSON}" "${SPY_JSON}"; do
+            if [ ! -f "${doc}" ]; then
+              fail "Expected document missing: ${doc:-<empty output>}"
+              continue
+            fi
+            # tools is a list up to spec 1.4 and an object from 1.5;
+            # cargo-cyclonedx writes the list form at 1.5 too
+            if ! jq -e '.metadata.tools
+              | (if type == "array" then . else .components // [] end)
+              | any(.name? == "cargo-cyclonedx")' "${doc}" > /dev/null
+            then
+              fail "Document not produced by cargo-cyclonedx: ${doc}"
+            fi
+          done
+          if [ "${failures}" != "0" ]; then
+            exit 1
+          fi
+
+          # A crate with no dependencies, found by auto-detection
+          [ "${CRATE_MANAGER}" = "cargo" ] || \
+            fail "auto did not detect Cargo: ${CRATE_MANAGER}"
+          [ "${CRATE_COUNT}" = "0" ] || \
+            fail "Dependency-free crate lists ${CRATE_COUNT} components"
+          jq -e '.metadata.component.name == "lfreleng-test-rust-project"' \
+            "${CRATE_JSON}" > /dev/null || \
+            fail "Single crate is not the anchor component"
+
+          # Single root: metadata.component names the crate and its
+          # dependencies entry lists what it declares
+          [ "$(components "${DEPS_JSON}")" = "semver:required" ] || \
+            fail "crates.io dependency: unexpected components"
+          [ "$(depends_on "${DEPS_JSON}" \
+            lfreleng-fixture-dependencies)" = "semver" ] || \
+            fail "Anchor does not depend on semver"
+          grep -q 'xmlns="http://cyclonedx.org/schema/bom/1.5"' \
+            "${DEPS_XML}" || fail "XML document is not CycloneDX 1.5"
+          grep -q '<name>semver</name>' "${DEPS_XML}" || \
+            fail "XML document lacks semver"
+
+          # Workspace: one document, the reactor shape. The root has no
+          # edges; every member is an unscoped component with its own.
+          ws_core="lfreleng-fixture-workspace-core"
+          ws_core="${ws_core}-name-too-long-for-crates-io-by-design"
+          ws_cli="lfreleng-fixture-workspace-cli"
+          ws_cli="${ws_cli}-name-too-long-for-crates-io-by-design"
+          expected="$(printf '%s\n' "${ws_core}:-" \
+            "lfreleng-fixture-workspace-support:-" "${ws_cli}:-" | sort)"
+          [ "$(components "${WS_JSON}" | sort)" = "${expected}" ] || \
+            fail "Workspace members are not unscoped components"
+          [ "${WS_COUNT}" = "3" ] || \
+            fail "Workspace component_count: ${WS_COUNT}"
+          jq -e '.metadata.component["bom-ref"] as $root
+            | [.dependencies[] | select(.ref == $root)]
+            | length == 1 and ((.[0].dependsOn // []) | length == 0)' \
+            "${WS_JSON}" > /dev/null || \
+            fail "Workspace root is not an edgeless dependencies entry"
+          [ "$(depends_on "${WS_JSON}" "${ws_cli}")" = "${ws_core}" ] || \
+            fail "Workspace lost the cli -> core edge"
+          [ -z "$(depends_on "${WS_JSON}" "${ws_core}")" ] || \
+            fail "core's dev-dependency appears as an edge"
+
+          # path_prefix at a member describes that member alone
+          jq -e --arg cli "${ws_cli}" '.metadata.component.name == $cli' \
+            "${MEMBER_JSON}" > /dev/null || fail "Member is not the anchor"
+          [ "$(components "${MEMBER_JSON}")" = "${ws_core}:required" ] \
+            || fail "Member document: unexpected components"
+
+          [ -f "${WS_XML}" ] || fail "XML-only workspace run wrote no XML"
+          [ -z "${WS_XML_JSON}" ] || fail "XML-only run reported JSON"
+          [ -z "$(find cargo-xml-out -name '*.json')" ] || \
+            fail "XML-only run left a JSON document behind"
+
+          # include_dev: build-dependencies only, scoped excluded;
+          # dev-dependencies never
+          [ -z "$(components "${BUILD_JSON}")" ] || \
+            fail "Build-dependency present without include_dev"
+          [ "$(components "${BUILD_DEV_JSON}")" = "semver:excluded" ] \
+            || fail "include_dev did not add the build-dependency"
+          [ -z "$(components "${DEV_DEV_JSON}")" ] || \
+            fail "Dev-dependency present"
+
+          # Targets
+          [ "$(components "${ALL_JSON}")" = "semver:required" ] || \
+            fail "Windows-only dependency missing under every target"
+          [ -z "$(components "${LINUX_JSON}")" ] || \
+            fail "Windows-only dependency present for a Linux target"
+
+          # A missing lockfile resolves for the run and is removed
+          [ ! -e test-project/variants/no-lockfile/Cargo.lock ] || \
+            fail "The resolved Cargo.lock was left in the checkout"
+
+          # The scrub, as code from the checkout sees it
+          spy=cargo-fixtures/spy/spy-env.txt
+          if [ ! -s "${spy}" ]; then
+            fail "The rustc wrapper never ran"
+          else
+            for name in CARGO_REGISTRY_TOKEN \
+              CARGO_REGISTRIES_PRIVATE_TOKEN \
+              ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+              ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN \
+              GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+              GITHUB_STEP_SUMMARY; do
+              if grep -q "^${name}=" "${spy}"; then
+                fail "${name} reached code from the checkout"
+              fi
+            done
+            grep -q '^CARGO_REGISTRIES_PRIVATE_INDEX=' "${spy}" || \
+              fail "The scrub removed a registry setting"
+          fi
+
+          # Failures
+          [ "${STALE_OUTCOME}" = "failure" ] || \
+            fail "A stale Cargo.lock did not fail the run"
+          cmp -s cargo-fixtures/stale.lock cargo-fixtures/stale/Cargo.lock \
+            || fail "The run rewrote a stale Cargo.lock"
+          [ "${SPEC_OUTCOME}" = "failure" ] || \
+            fail "CycloneDX 1.6 did not fail for Cargo"
+          [ "${UNTRUSTED_SKIPPED}" = "true" ] || \
+            fail "An untrusted Cargo checkout was not skipped"
+          for prefix in sbom-stale sbom-spec sbom-untrusted; do
+            [ -z "$(find cargo-out -name "${prefix}.*")" ] || \
+              fail "${prefix}: a document survived a failed or skipped run"
+          done
+
+          # Nothing left in the checkout: no per-member documents and no
+          # lockfile changes
+          litter="$(git -C test-project status --porcelain)"
+          [ -z "${litter}" ] || fail "Checkout changed: ${litter}"
+          [ -z "$(find . -name 'sbom-action-*.json')" ] || \
+            fail "cargo-cyclonedx documents left behind"
+
+          if [ "${failures}" != "0" ]; then
+            echo "Cargo backend verification failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Cargo backend verified ✅"
+          {
+            echo "Cargo backend verified ✅"
+            echo "Workspace members described: ${WS_COUNT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ### Test invalid inputs fail closed ###
   test-failures:
     name: "Test: invalid inputs and error handling"
@@ -1552,9 +2012,42 @@ jobs:
         with:
           maven_plugin_version: '2.7.5'
 
+      # The Cargo tool versions become taiki-e/install-action tool
+      # specifications and cargo_target a cargo-cyclonedx argument, so
+      # they too are validated on every run
+      - name: "Running local action with invalid cargo-cyclonedx version"
+        id: bad-cargo-cyclonedx-version
+        continue-on-error: true
+        uses: $/
+        with:
+          cargo_cyclonedx_version: '0.5.9,cargo-audit'
+
+      # Releases before 0.5.5 lack --no-build-deps, which carries the
+      # default include_dev: false
+      - name: "Running local action with an outdated cargo-cyclonedx"
+        id: old-cargo-cyclonedx-version
+        continue-on-error: true
+        uses: $/
+        with:
+          cargo_cyclonedx_version: '0.5.4'
+
+      - name: "Running local action with invalid cyclonedx-cli version"
+        id: bad-cyclonedx-cli-version
+        continue-on-error: true
+        uses: $/
+        with:
+          cyclonedx_cli_version: 'latest'
+
+      - name: "Running local action with invalid cargo target"
+        id: bad-cargo-target
+        continue-on-error: true
+        uses: $/
+        with:
+          cargo_target: '--config=build.rustc-wrapper=x'
+
       # The cyclonedx backend names the tool, not the build system, so
-      # it has to detect one. This repository has neither a pom.xml nor
-      # a Gradle build script, so detection must fail rather than
+      # it has to detect one. This repository has no pom.xml, Gradle
+      # build script or Cargo.toml, so detection must fail rather than
       # falling through to a Maven invocation that cannot work.
       # untrusted_checkout is forced off so the run reaches detection:
       # this workflow runs on a fork pull request, where the default
@@ -1588,8 +2081,8 @@ jobs:
       # than relying on 'auto': this workflow also runs on pushes to
       # main and same-repository pull requests, where 'auto' resolves
       # to trusted and the action would instead fail on this
-      # repository having no Maven or Gradle build. The detection
-      # itself is covered by the validation matrix, not here.
+      # repository having no Maven, Gradle or Cargo build. The
+      # detection itself is covered by the validation matrix, not here.
       - name: "Running cyclonedx backend on an untrusted checkout"
         id: untrusted-skip
         uses: $/
@@ -1848,7 +2341,7 @@ jobs:
           backend: cyclonedx
           untrusted_checkout: 'false'
           # Pointed at the skip-pom fixture, not the repository root:
-          # at the root the run would fail on 'no Maven or Gradle
+          # at the root the run would fail on 'no Maven, Gradle or Cargo
           # project found' and the outcome assertion would pass
           # without ever reaching the maven_args normalisation.
           #
@@ -1909,6 +2402,13 @@ jobs:
           JAVA_DISTRIBUTION_OUTCOME: ${{ steps.bad-java-distribution.outcome }}
           PLUGIN_VERSION_OUTCOME: ${{ steps.bad-plugin-version.outcome }}
           OLD_PLUGIN_OUTCOME: ${{ steps.old-plugin-version.outcome }}
+          # yamllint disable-line rule:line-length
+          CARGO_CDX_VERSION_OUTCOME: ${{ steps.bad-cargo-cyclonedx-version.outcome }}
+          # yamllint disable-line rule:line-length
+          OLD_CARGO_CDX_OUTCOME: ${{ steps.old-cargo-cyclonedx-version.outcome }}
+          # yamllint disable-line rule:line-length
+          CDX_CLI_VERSION_OUTCOME: ${{ steps.bad-cyclonedx-cli-version.outcome }}
+          CARGO_TARGET_OUTCOME: ${{ steps.bad-cargo-target.outcome }}
           NO_BUILD_TOOL_OUTCOME: ${{ steps.no-build-tool.outcome }}
           SKIP_OUTCOME: ${{ steps.untrusted-skip.outcome }}
           SKIP_SKIPPED: ${{ steps.untrusted-skip.outputs.skipped }}
@@ -1955,6 +2455,10 @@ jobs:
             "java-distribution:${JAVA_DISTRIBUTION_OUTCOME}" \
             "plugin-version:${PLUGIN_VERSION_OUTCOME}" \
             "old-plugin:${OLD_PLUGIN_OUTCOME}" \
+            "cargo-cyclonedx-version:${CARGO_CDX_VERSION_OUTCOME}" \
+            "old-cargo-cyclonedx:${OLD_CARGO_CDX_OUTCOME}" \
+            "cyclonedx-cli-version:${CDX_CLI_VERSION_OUTCOME}" \
+            "cargo-target:${CARGO_TARGET_OUTCOME}" \
             "no-build-tool:${NO_BUILD_TOOL_OUTCOME}" \
             "collide:${COLLIDE_OUTCOME}" \
             "collide-decoy:${COLLIDE_DECOY_OUTCOME}" \
@@ -2024,7 +2528,7 @@ jobs:
             fi
           fi
           # The trusted arm is expected to FAIL: this repository has no
-          # Maven or Gradle build, so detection rejects it. What must
+          # Maven, Gradle or Cargo build, so detection rejects it. What must
           # hold is that validation resolved the checkout as trusted
           # first, which it records as skipped=false before detecting.
           if [ "${AUTO_TRUSTED_OUTCOME}" != "skipped" ]; then
