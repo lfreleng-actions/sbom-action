@@ -47,21 +47,23 @@ system it drives.
 
 <!-- markdownlint-disable MD013 -->
 
-| Backend          | Tool                             | Build tools driven | Needs a toolchain | Use for                                 |
-| ---------------- | -------------------------------- | ------------------ | ----------------- | --------------------------------------- |
-| `syft` (default) | syft static analysis             | none               | No                | Go, Node.js, Rust, containers, binaries |
-| `cyclonedx`      | CycloneDX build-tool plugins     | Maven, Gradle      | JDK + build tool  | Java projects                           |
+| Backend          | Tool                         | Build tools driven   | Needs a toolchain                   | Use for                                 |
+| ---------------- | ---------------------------- | -------------------- | ----------------------------------- | --------------------------------------- |
+| `syft` (default) | syft static analysis         | none                 | No                                  | Go, Node.js, Rust, containers, binaries |
+| `cyclonedx`      | CycloneDX build-tool plugins | Maven, Gradle, Cargo | JDK + build tool, or Rust toolchain | Java and Rust projects                  |
 
 <!-- markdownlint-enable MD013 -->
 
 `cyclonedx-gradle-plugin` is the same tool family solving the same
 problem as `cyclonedx-maven-plugin`, so Gradle joins the **existing**
-`cyclonedx` backend rather than arriving as a separate one. Callers keep
-the same `backend` value, and the action resolves the build system from
-the project unless the caller declares it.
+`cyclonedx` backend rather than arriving as a separate one, and so does
+`cargo-cyclonedx` for Rust. Callers keep the same `backend` value, and
+the action resolves the build system from the project unless the caller
+declares it.
 
 Because the backend name does not identify the build system, the
-`dependency_manager` output reports which one ran (`maven` or `gradle`).
+`dependency_manager` output reports which one ran (`maven`, `gradle` or
+`cargo`).
 It stays empty for `syft`, which drives no build tool.
 
 The `cyclonedx` backend fails fast when it cannot find a build system
@@ -113,6 +115,20 @@ does not. That records which direct dependency pulled in a given
 transitive component, the question people actually ask when triaging a
 finding.
 
+### Why Rust can use it too
+
+`Cargo.lock` is a resolved graph, so syft does find every crate in a
+Rust project, and more besides: the lockfile lists every crate that
+any target, test or build script could need, and syft records no scope
+and no edges for them. Under syft,
+`include_dev: false` means nothing for Rust.
+
+`cargo-cyclonedx` works from `cargo metadata`, cargo's own resolution.
+It leaves dev-dependencies out, marks build-dependencies, honours the
+target platform and emits the `dependencies` graph a scanner needs to
+tell a crate the project declares from one it inherits. See
+[Cargo specifics](#cargo-specifics).
+
 ### Trust Boundary
 
 > ⚠️ **The `cyclonedx` backend requires a trusted checkout.** Running a
@@ -134,10 +150,19 @@ Gradle goes further, because evaluating a build *is* running code:
   the project and `gradle-wrapper.jar` is a binary it executes, which
   the action runs in preference to any `gradle` on `PATH`.
 
+Cargo resolves without compiling, but still reads configuration that
+names programs to run:
+
+- `.cargo/config.toml` can set `build.rustc-wrapper`, which
+  `cargo metadata` and `cargo-cyclonedx` both execute (measured);
+- `rust-toolchain.toml` selects the toolchain, which can be a
+  directory inside the checkout, and the action runs cargo from the
+  project directory so that file applies.
+
 No command-line flag turns any of that off, and for Maven it happens
 even though the goal never compiles source or runs tests. A project
-supplying a core extension, a build script or a wrapper thus executes
-code in the job.
+supplying a core extension, a build script, a wrapper or a cargo
+configuration thus executes code in the job.
 
 This is a real difference from the `syft` backend, which reads files
 and executes nothing from the project.
@@ -284,8 +309,9 @@ The `syft` backend downloads the syft binary via the pinned
 `anchore/sbom-action/download-syft` helper, so runners need egress to
 GitHub release assets.
 
-The `cyclonedx` backend installs a JDK with `actions/setup-java`, so
-runners need egress to the JDK distribution and to the repositories the
+For Maven and Gradle the `cyclonedx` backend installs a JDK with
+`actions/setup-java`, so runners need egress to the JDK distribution and
+to the repositories the
 project resolves against (Maven Central by default). Gradle adds the
 Gradle distribution host, which the wrapper downloads from, and the
 Gradle Plugin Portal, where `cyclonedx-gradle-plugin` resolves from
@@ -322,23 +348,42 @@ proxies or private repository credentials before invoking this action
 keeps them; `setup-java` still writes its default file where none
 exists.
 
+For Cargo the backend installs no JDK. It needs a **Rust toolchain on
+the runner** (`cargo` on `PATH`); GitHub-hosted images ship `rustup`,
+and the run fails before installing anything where `cargo` is absent.
+The action pins no toolchain: cargo runs from the project directory,
+where the project's `rust-toolchain.toml` applies and `rustup` may
+install the toolchain it names. A caller wanting a particular toolchain
+sets it up before this action.
+
+`taiki-e/install-action` fetches `cargo-cyclonedx`, and for XML
+output `cyclonedx-cli`, as prebuilt release binaries checked against
+the SHA-256 digests in its pinned manifest. It never falls back to
+compiling them from source, so a runner platform without a prebuilt
+binary fails. `cyclonedx-cli` is a self-contained .NET binary of
+about 80 MB; `sbom_format: json` skips it. Runners need egress to
+GitHub release assets, to the crates.io index and download hosts
+(`index.crates.io`, `static.crates.io`) or the registries the project
+resolves against, and to the `rustup` distribution host where the
+project's toolchain is not installed yet.
+
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                    | Required | Default          | Description                                                           |
-| ----------------------- | -------- | ---------------- | --------------------------------------------------------------------- |
-| backend                 | False    | `syft`           | SBOM generation backend: `syft` or `cyclonedx`                        |
-| mode                    | False    | `directory`      | What to describe: `directory` (`path_prefix`) or `image`              |
-| path_prefix             | False    | `.`              | Project directory; must resolve within the workspace                  |
-| image_archive_directory | False    | `''`             | Image mode: directory of docker archives, one image per `*.tar` file  |
-| sbom_format             | False    | `both`           | SBOM output format: `json`, `xml`, or `both`                          |
-| sbom_spec_version       | False    | `1.5`            | CycloneDX specification version to use                                |
-| filename_prefix         | False    | `sbom-cyclonedx` | Base filename for SBOM output (without extension)                     |
-| output_directory        | False    | `.`              | SBOM report directory, within workspace or runner temp                |
-| include_dev             | False    | `false`          | Include development dependencies (Maven: test scope) in SBOM          |
-| fail_on_error           | False    | `true`           | Fail the action if SBOM generation encounters errors                  |
-| syft_version            | False    | `''`             | Syft version to download (defaults to the installer's pinned version) |
+| Name                    | Required | Default          | Description                                                                              |
+| ----------------------- | -------- | ---------------- | ---------------------------------------------------------------------------------------- |
+| backend                 | False    | `syft`           | SBOM generation backend: `syft` or `cyclonedx`                                           |
+| mode                    | False    | `directory`      | What to describe: `directory` (`path_prefix`) or `image`                                 |
+| path_prefix             | False    | `.`              | Project directory; must resolve within the workspace                                     |
+| image_archive_directory | False    | `''`             | Image mode: directory of docker archives, one image per `*.tar` file                     |
+| sbom_format             | False    | `both`           | SBOM output format: `json`, `xml`, or `both`                                             |
+| sbom_spec_version       | False    | `1.5`            | CycloneDX specification version to use                                                   |
+| filename_prefix         | False    | `sbom-cyclonedx` | Base filename for SBOM output (without extension)                                        |
+| output_directory        | False    | `.`              | SBOM report directory, within workspace or runner temp                                   |
+| include_dev             | False    | `false`          | Include development dependencies in SBOM; see [scoping](#development-dependency-scoping) |
+| fail_on_error           | False    | `true`           | Fail the action if SBOM generation encounters errors                                     |
+| syft_version            | False    | `''`             | Syft version to download (defaults to the installer's pinned version)                    |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -349,27 +394,34 @@ them on every run so a typo surfaces regardless of the backend in use.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                  | Required | Default   | Description                                                      |
-| --------------------- | -------- | --------- | ---------------------------------------------------------------- |
-| dependency_manager    | False    | `auto`    | Build tool: `auto`, `maven` or `gradle`                          |
-| java_version          | False    | `21`      | JDK version for the cyclonedx backend                            |
-| java_distribution     | False    | `temurin` | JDK distribution for the cyclonedx backend                       |
-| maven_plugin_version  | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer               |
-| maven_args            | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace  |
-| gradle_plugin_version | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer              |
-| gradle_version        | False    | `''`      | Gradle version the project uses; empty asks the build tool       |
-| gradle_args           | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace |
-| untrusted_checkout    | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`             |
+| Name                    | Required | Default   | Description                                                      |
+| ----------------------- | -------- | --------- | ---------------------------------------------------------------- |
+| dependency_manager      | False    | `auto`    | Build tool: `auto`, `maven`, `gradle` or `cargo`                 |
+| java_version            | False    | `21`      | JDK version for the cyclonedx backend                            |
+| java_distribution       | False    | `temurin` | JDK distribution for the cyclonedx backend                       |
+| maven_plugin_version    | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer               |
+| maven_args              | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace  |
+| gradle_plugin_version   | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer              |
+| gradle_version          | False    | `''`      | Gradle version the project uses; empty asks the build tool       |
+| gradle_args             | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace |
+| cargo_cyclonedx_version | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                      |
+| cyclonedx_cli_version   | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo       |
+| cargo_target            | False    | `all`     | Cargo: `all` targets, or one target triple to describe           |
+| untrusted_checkout      | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`             |
 
 <!-- markdownlint-enable MD013 -->
 
 #### Choosing the build tool
 
 Left at `auto`, the action reads the project directory: a `pom.xml`
-selects Maven, a Gradle build script selects Gradle, and a tree carrying
-both resolves as Maven.
+selects Maven, a Gradle build script selects Gradle, and a `Cargo.toml`
+selects Cargo. Where a tree carries more than one, the first in that
+order wins: a tree carrying both a `pom.xml` and a Gradle build resolves
+as Maven, and a Java project carrying a `Cargo.toml` for a native helper
+stays a Java project.
 
-That last case is a guess about intent, and a caller often knows better.
+Those mixed cases are guesses about intent, and a caller often knows
+better.
 A reusable workflow dedicated to one build tool always does, because the
 caller chose that workflow. `build-metadata-action` reports the same
 fact as `build_tool`, so a lane can pass it straight through:
@@ -484,6 +536,104 @@ plugin's declared dependency would punish a project for something
 unrelated to its own code. The run reports why, `skipped` returns
 `true`, and the action writes no document and reports no count — leaving
 the project free to raise its wrapper version and get results.
+
+#### Cargo specifics
+
+The action runs the installed `cargo-cyclonedx` binary directly rather
+than as `cargo cyclonedx`. Cargo resolves a subcommand through aliases
+in the checkout's `.cargo/config.toml` and through `PATH`, so the
+subcommand name could reach a different program. It always passes
+`--format json` and the spec version explicitly, because the tool's
+own defaults are XML and CycloneDX 1.3.
+
+**Specification versions.** `cargo-cyclonedx` writes CycloneDX 1.3,
+1.4 and 1.5, and no later version. Validation rejects any other
+`sbom_spec_version` for Cargo, rather than letting the tool fail later.
+The default, `1.5`, works. The action writes the XML document with
+`cyclonedx-cli` from the finished JSON one, so both formats describe
+the same document; measured against `cargo-cyclonedx`'s own XML, the
+two differ in timestamp precision alone.
+
+**Lockfiles.** A missing `Cargo.lock` gets resolved for the run, with
+a warning, and removed afterwards; the SBOM then describes what
+resolves today rather than what the project pinned. A **stale**
+lockfile, one cargo would have to change, fails the run.
+`cargo-cyclonedx` would otherwise rewrite it in the checkout without a
+word (measured) and describe a graph no build of this commit uses, so
+the action has `cargo metadata --locked` accept the lockfile first and
+leaves it untouched.
+
+**Targets.** `cargo_target: all`, the default, describes the
+dependencies of every platform. `Cargo.lock` serves every platform,
+and a crate ships to platforms the runner is not, so describing the
+runner's alone would leave platform-specific dependencies unscanned. A
+target triple narrows the document to that platform. The action
+removes `CARGO_BUILD_TARGET` from the tool's environment, because
+`cargo-cyclonedx` 0.5.9 lets it override `--target`, `all` included
+(measured). The document records the choice in
+`metadata.properties`, as `cdx:rustc:sbom:target:all_targets` or
+`cdx:rustc:sbom:target:triple`.
+
+**Workspaces.** `cargo-cyclonedx` writes one document per workspace
+member, beside each member's `Cargo.toml`, whichever manifest the
+action names; it has no output directory option. The action gives those files
+a random name, collects the ones it needs and removes the rest, so the
+checkout ends as the run found it. What the SBOM describes depends on
+where `path_prefix` points:
+
+- **A single package**, outside any workspace or alone in one: its
+  document as `cargo-cyclonedx` wrote it.
+- **A workspace member**: that member's document alone. Sibling
+  members it depends on appear as ordinary components, scoped
+  `required`; their `path+file://` reference alone tells them apart from
+  crates.io crates.
+- **The workspace root**, a root package or a virtual workspace: every
+  member's document merged into one.
+
+The merged document takes the shape `cyclonedx-maven-plugin` gives a
+reactor. `metadata.component` is a synthetic `library` named after the
+workspace directory, with the reference `path+file://<workspace
+root>`, and its `dependencies` entry carries **no** `dependsOn`. Each
+member becomes a top-level component without a scope, keeping its own
+`dependsOn`. Every other component keeps the scope `cargo-cyclonedx`
+gave it, the strongest where members disagree, and `bom-ref` values
+stay as cargo emits them, unaltered. A root that depended on its members
+would put every crate a member declares one hop further from the
+anchor, so a reader of the graph would take it for inherited.
+
+Measured against `cargo-cyclonedx` 0.5.9:
+
+<!-- markdownlint-disable MD013 -->
+
+| Case                     | `dependencies` graph                     | Anchor                                                         |
+| ------------------------ | ---------------------------------------- | -------------------------------------------------------------- |
+| Single crate             | Full transitive edges                    | `metadata.component` (the crate); `dependsOn` its direct deps  |
+| `path_prefix` at member  | Full transitive edges                    | That member; sibling members are components scoped `required`  |
+| Workspace root (merged)  | Full, with each member's own edges       | Synthetic root without edges; members carry no scope           |
+
+<!-- markdownlint-enable MD013 -->
+
+In every shape each component has a `dependencies` entry, even one
+without dependencies, and no edge names a missing reference. A
+`bom-ref` is cargo's package ID, such as
+`registry+https://github.com/rust-lang/crates.io-index#semver@1.0.28`
+or `path+file:///<checkout>/core#name@0.1.0`, with the `purl`
+(`pkg:cargo/semver@1.0.28`) alongside. Cargo targets nest under
+their package as components and appear nowhere in the graph.
+`metadata.tools` lists `cargo-cyclonedx` in the 1.4 form, a list, at
+spec 1.5 too.
+
+**Environment.** cargo and `cargo-cyclonedx` run without
+`CARGO_REGISTRY_TOKEN`, any `CARGO_REGISTRIES_<NAME>_TOKEN`, the GitHub
+OIDC request variables, `ACTIONS_RUNTIME_TOKEN`, or the paths of the
+runner's command files (`GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`,
+`GITHUB_STATE` and `GITHUB_STEP_SUMMARY`). Other registry settings,
+such as `CARGO_REGISTRIES_<NAME>_INDEX`, stay, since resolution may
+need them. That narrows what a rustc wrapper from the checkout can
+reach, but remains defence in depth rather than a boundary: code running
+as the same user can still read an ancestor process's environment and
+find the command files at their predictable paths. The
+[Trust Boundary](#trust-boundary) still applies.
 
 ## Verification After Generation
 
@@ -647,6 +797,23 @@ Note that the plugin's `skipNotDeployed` default also excludes modules
 that set `maven.deploy.skip`, which is consistent with describing the
 deployed product but can surprise anyone counting components on a
 project with non-deployed test-harness modules.
+
+**For Cargo, `include_dev` cannot include dev-dependencies.**
+`cargo-cyclonedx` never records them, as neither component nor edge,
+and offers no flag to include them (measured on 0.5.9). A Cargo SBOM
+from this backend never describes `[dev-dependencies]`,
+whatever `include_dev` says. A caller that needs them listed has no
+route through this backend; the `syft` backend lists every locked
+crate, unscoped.
+
+What `include_dev` does control for Cargo is **build-dependencies**:
+crates that build scripts run on the build machine, which never ship.
+By default the action passes `--no-build-deps`, which drops them and
+their edges. `include_dev: 'true'` keeps them, scoped `excluded`,
+including the build-dependencies of dependencies (such as `cc` under a
+`-sys` crate), and logs a warning that dev-dependencies stay absent. A
+crate that is both a normal and a build dependency keeps the scope
+`required` either way.
 
 ## Monorepo and Nested Module Support
 
@@ -876,9 +1043,9 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager` and `untrusted_checkout` inputs against restricted value sets before use; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, and skips a Gradle version below the plugin's floor where the caller supplied one
-2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java`. The selected backend guards each step, so neither costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. In both cases the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
+1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version` and `cargo_target` inputs against restricted value sets before use; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
+2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java` for Maven and Gradle, or for Cargo installs `cargo-cyclonedx` (and `cyclonedx-cli` for XML output) via the pinned `taiki-e/install-action`. The selected backend and build tool guard each step, so none costs anything when unused
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
 4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary; in image mode, the image count, manifest, its path, and the list of files written
 
 <!-- markdownlint-enable MD013 -->
@@ -898,7 +1065,8 @@ would leave behind a document the caller did not request, which the
 - The `syft` backend reads lockfiles/manifests without installing
   project dependencies, so generation is fast and needs no language
   toolchain. The `cyclonedx` backend necessarily gives up that property:
-  resolving a Maven dependency graph requires Maven
+  resolving a Maven dependency graph requires Maven, and a Cargo one
+  requires cargo
 - For Python projects, prefer
   [python-sbom-action](https://github.com/lfreleng-actions/python-sbom-action):
   its environment-based generation gives higher-fidelity results for

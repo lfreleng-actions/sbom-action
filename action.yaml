@@ -17,8 +17,8 @@ description: "Generates CycloneDX SBOM reports for projects and container images
 #
 # Backends name the TOOL that produces the document, not the build
 # system it drives. The cyclonedx backend runs the CycloneDX project's
-# own build-tool plugins; today that means cyclonedx-maven-plugin, and
-# cyclonedx-gradle-plugin joins it behind the same backend name. The
+# own build-tool plugins: cyclonedx-maven-plugin, cyclonedx-gradle-plugin
+# and, for Rust, cargo-cyclonedx, all behind the same backend name. The
 # build tool actually used is reported through the dependency_manager
 # output rather than encoded in the backend name, mirroring how
 # python-sbom-action reports the manager it detected.
@@ -32,6 +32,12 @@ description: "Generates CycloneDX SBOM reports for projects and container images
 # uv.lock), so they stay on the syft backend. Java is the outlier, and
 # driving the build tool's own resolver is the only way to see its real
 # dependency set.
+#
+# Rust ships a resolved manifest too, but Cargo.lock lists every crate
+# any target, test or build script could need, with no scope and no
+# edges syft keeps. cargo-cyclonedx reads cargo's own resolution, so
+# it can leave out dev-dependencies, scope build-dependencies and emit
+# the dependency graph a scanner needs to tell direct from inherited.
 #
 # mode selects WHAT the document describes, independently of the
 # backend: 'directory' (the default) scans path_prefix, and 'image'
@@ -80,7 +86,7 @@ inputs:
     default: "."
   include_dev:
     # yamllint disable-line rule:line-length
-    description: "Include development dependencies (Maven test scope, Gradle test configurations) in SBOM"
+    description: "Include development dependencies (Maven test scope, Gradle test configurations, Cargo build-dependencies) in SBOM"
     required: false
     default: "false"
   fail_on_error:
@@ -119,7 +125,7 @@ inputs:
     default: "auto"
   dependency_manager:
     # yamllint disable-line rule:line-length
-    description: "Build tool for the cyclonedx backend: 'auto', 'maven' or 'gradle'"
+    description: "Build tool for the cyclonedx backend: 'auto', 'maven', 'gradle' or 'cargo'"
     required: false
     default: "auto"
   gradle_plugin_version:
@@ -137,6 +143,21 @@ inputs:
     description: "Extra arguments appended to the Gradle call, split on whitespace"
     required: false
     default: ""
+  cargo_cyclonedx_version:
+    # yamllint disable-line rule:line-length
+    description: "cargo-cyclonedx version for Cargo projects; 0.5.5 or newer"
+    required: false
+    default: "0.5.9"
+  cyclonedx_cli_version:
+    # yamllint disable-line rule:line-length
+    description: "cyclonedx-cli version; writes XML for Cargo projects"
+    required: false
+    default: "0.33.1"
+  cargo_target:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: 'all' targets, or one target triple to describe"
+    required: false
+    default: "all"
 
 outputs:
   sbom_json_path:
@@ -205,6 +226,10 @@ runs:
         INPUT_GRADLE_VERSION: ${{ inputs.gradle_version }}
         INPUT_DEPENDENCY_MANAGER: ${{ inputs.dependency_manager }}
         INPUT_UNTRUSTED_CHECKOUT: ${{ inputs.untrusted_checkout }}
+        # yamllint disable-line rule:line-length
+        INPUT_CARGO_CYCLONEDX_VERSION: ${{ inputs.cargo_cyclonedx_version }}
+        INPUT_CYCLONEDX_CLI_VERSION: ${{ inputs.cyclonedx_cli_version }}
+        INPUT_CARGO_TARGET: ${{ inputs.cargo_target }}
         # Empty for every event that is not a pull request. Compared
         # against GITHUB_REPOSITORY (a default runner variable) to test
         # whether the head lives outside the base repository.
@@ -411,10 +436,44 @@ runs:
             exit 1 ;;
         esac
         case "${INPUT_DEPENDENCY_MANAGER}" in
-          auto|maven|gradle) ;;
+          auto|maven|gradle|cargo) ;;
           *)
-            echo "Error: dependency_manager must be 'auto', 'maven'" \
-              "or 'gradle' ❌"
+            echo "Error: dependency_manager must be 'auto', 'maven'," \
+              "'gradle' or 'cargo' ❌"
+            exit 1 ;;
+        esac
+        # The Cargo tool versions reach taiki-e/install-action as
+        # tool@version specifications, and cargo_target reaches the
+        # command line, so all three get the whole-string treatment.
+        case "${INPUT_CARGO_CYCLONEDX_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid cargo_cyclonedx_version ❌"
+            echo "Expected a version such as 0.5.9"
+            exit 1 ;;
+        esac
+        # --no-build-deps, which carries include_dev, arrived in 0.5.5.
+        # Earlier releases reject the flag, so they cannot honour the
+        # default include_dev: false.
+        cargo_cyclonedx_minimum="0.5.5"
+        oldest="$(printf '%s\n%s\n' "${INPUT_CARGO_CYCLONEDX_VERSION}" \
+          "${cargo_cyclonedx_minimum}" | sort -V | head -1)"
+        if [ "${oldest}" != "${cargo_cyclonedx_minimum}" ]; then
+          echo "Error: cargo_cyclonedx_version is too old ❌"
+          echo "Minimum supported: ${cargo_cyclonedx_minimum}"
+          echo "Earlier releases lack --no-build-deps"
+          exit 1
+        fi
+        case "${INPUT_CYCLONEDX_CLI_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid cyclonedx_cli_version ❌"
+            echo "Expected a version such as 0.33.1"
+            exit 1 ;;
+        esac
+        case "${INPUT_CARGO_TARGET}" in
+          *[!A-Za-z0-9._-]*|''|-*)
+            echo "Error: invalid cargo_target ❌"
+            echo "Expected 'all' or a target triple such as"
+            echo "x86_64-unknown-linux-gnu"
             exit 1 ;;
         esac
         workspace="$(realpath -- "${GITHUB_WORKSPACE}")"
@@ -617,10 +676,18 @@ runs:
             [ -f "${resolved}/settings.gradle.kts" ]; then
             dependency_manager="gradle"
             echo "Detected build tool: ${dependency_manager}"
+          # Checked last, so every tree that resolved before Cargo
+          # joined still resolves the same way: a Java project carrying
+          # a Cargo.toml for a native helper stays a Java project. A
+          # mixed tree whose SBOM should describe the crate says so
+          # through dependency_manager.
+          elif [ -f "${resolved}/Cargo.toml" ]; then
+            dependency_manager="cargo"
+            echo "Detected build tool: ${dependency_manager}"
           else
-            echo "Error: no Maven or Gradle project found ❌"
-            echo "The cyclonedx backend needs a pom.xml or a Gradle"
-            echo "build script in the project directory"
+            echo "Error: no Maven, Gradle or Cargo project found ❌"
+            echo "The cyclonedx backend needs a pom.xml, a Gradle"
+            echo "build script or a Cargo.toml in the project directory"
             exit 1
           fi
 
@@ -645,9 +712,46 @@ runs:
                 echo "carries no Gradle build"
                 exit 1
               fi ;;
+            cargo)
+              if [ ! -f "${resolved}/Cargo.toml" ]; then
+                echo "Error: no Cargo.toml in the project directory ❌"
+                echo "dependency_manager is 'cargo' but the checkout"
+                echo "carries no Cargo project"
+                exit 1
+              fi
+              # cargo-cyclonedx drives cargo, and through it rustc, so
+              # the runner needs a Rust toolchain. Checked here so a
+              # runner without one fails before any tool is installed.
+              if ! command -v cargo > /dev/null 2>&1; then
+                echo "Error: cargo not found on PATH ❌"
+                echo "Cargo projects need a Rust toolchain on the"
+                echo "runner; GitHub-hosted runners ship rustup"
+                exit 1
+              fi
+              # cargo-cyclonedx exits 2 on any other version, before
+              # writing anything; saying so here names the input.
+              case "${INPUT_SBOM_SPEC_VERSION}" in
+                1.3|1.4|1.5) ;;
+                *)
+                  echo "Error: sbom_spec_version unsupported for Cargo ❌"
+                  echo "cargo-cyclonedx emits CycloneDX 1.3, 1.4 or 1.5"
+                  exit 1 ;;
+              esac ;;
           esac
         fi
         echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
+
+        # The tools a Cargo run installs, as taiki-e/install-action
+        # tool specifications. cyclonedx-cli writes the XML document,
+        # so a JSON-only run does without it.
+        cargo_tools=""
+        if [ "${dependency_manager}" = "cargo" ]; then
+          cargo_tools="cargo-cyclonedx@${INPUT_CARGO_CYCLONEDX_VERSION}"
+          if [ "${INPUT_SBOM_FORMAT}" != "json" ]; then
+            cargo_tools="${cargo_tools},cyclonedx@${INPUT_CYCLONEDX_CLI_VERSION}"
+          fi
+        fi
+        echo "cargo_tools=${cargo_tools}" >> "$GITHUB_OUTPUT"
 
         # Now that the build tool is known, a supplied Gradle version
         # settles the plugin's floor here, before the JDK download
@@ -742,13 +846,28 @@ runs:
     # default, so nothing is lost by declining the overwrite.
     - name: "Set up JDK"
       # yamllint disable-line rule:line-length
-      if: ${{ inputs.backend == 'cyclonedx' && steps.validate.outputs.skipped != 'true' }}
+      if: ${{ inputs.backend == 'cyclonedx' && steps.validate.outputs.skipped != 'true' && steps.validate.outputs.dependency_manager != 'cargo' }}
       # yamllint disable-line rule:line-length
       uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
       with:
         java-version: ${{ inputs.java_version }}
         distribution: ${{ inputs.java_distribution }}
         overwrite-settings: false
+
+    # Cargo projects need no JDK: cargo-cyclonedx drives cargo from the
+    # runner's Rust toolchain. install-action fetches the release
+    # binaries and checks them against the SHA-256 digests its pinned
+    # manifest records. fallback 'none' keeps it from compiling the
+    # tools from source when no prebuilt binary matches the runner,
+    # which would run unreviewed build scripts and take minutes.
+    - name: "Install Cargo SBOM tools"
+      # yamllint disable-line rule:line-length
+      if: ${{ inputs.backend == 'cyclonedx' && steps.validate.outputs.skipped != 'true' && steps.validate.outputs.dependency_manager == 'cargo' }}
+      # yamllint disable-line rule:line-length
+      uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      with:
+        tool: ${{ steps.validate.outputs.cargo_tools }}
+        fallback: none
 
     - name: "Generate SBOM"
       id: generate
@@ -800,6 +919,9 @@ runs:
         # caller value still travels under its own name and is spliced
         # into the argument array after validation.
         INPUT_GRADLE_ARGS: ${{ inputs.gradle_args }}
+        CARGO_CYCLONEDX_VERSION: ${{ inputs.cargo_cyclonedx_version }}
+        CYCLONEDX_CLI_VERSION: ${{ inputs.cyclonedx_cli_version }}
+        CARGO_TARGET: ${{ inputs.cargo_target }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
         # exposes them
@@ -1539,9 +1661,15 @@ runs:
         # between runs on self-hosted runners.
         scratch_dir=""
         gradle_scratch=""
+        cargo_scratch=""
+        # Files a Cargo run creates inside the checkout, removed on the
+        # way out so the tree is left as the run found it
+        cargo_litter=()
         cleanup_scratch() {
           [ -z "${scratch_dir}" ] || rm -rf -- "${scratch_dir}"
           [ -z "${gradle_scratch}" ] || rm -rf -- "${gradle_scratch}"
+          [ -z "${cargo_scratch}" ] || rm -rf -- "${cargo_scratch}"
+          [ "${#cargo_litter[@]}" -eq 0 ] || rm -f -- "${cargo_litter[@]}"
         }
         trap cleanup_scratch EXIT
 
@@ -1550,6 +1678,7 @@ runs:
           json_path="${scratch_dir}/${FILENAME_PREFIX}.json"
         fi
 
+        backend_failure=""
         case "${BACKEND}" in
           syft)
             set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
@@ -1566,15 +1695,11 @@ runs:
             set -e
             ;;
           cyclonedx)
-            # Both build tools reach here. The backend names the
+            # Every build tool reaches here. The backend names the
             # tool producing the document rather than the build
             # system, so this dispatches on what validate resolved.
             case "${DEPENDENCY_MANAGER}" in
               maven)
-                # Only maven reaches here: validate rejects Gradle and
-                # anything unrecognised, so DEPENDENCY_MANAGER is 'maven'.
-                # A Gradle branch joins this case rather than becoming a
-                # separate backend.
                 # makeAggregateBom writes every requested format into one
                 # directory and cannot split them, so an xml-only run
                 # generates both into the scratch directory and moves the
@@ -2055,6 +2180,303 @@ runs:
                 backend_exit=$?
                 set -e
                 ;;
+              cargo)
+                # Everything cargo runs here treats the checkout as
+                # code: .cargo/config.toml can name a rustc wrapper,
+                # which cargo metadata and cargo-cyclonedx both execute
+                # (measured), and rust-toolchain.toml can select a
+                # toolchain directory inside the checkout. The
+                # untrusted-checkout skip covers Cargo for that reason.
+                #
+                # scrubbed runs a command from the project directory,
+                # so rustup selects the toolchain the project's
+                # rust-toolchain.toml names, without:
+                # - registry tokens: CARGO_REGISTRY_TOKEN and every
+                #   CARGO_REGISTRIES_<NAME>_TOKEN; other
+                #   CARGO_REGISTRIES_<NAME>_* settings, such as _INDEX,
+                #   stay, since resolution may need them;
+                # - the GitHub OIDC and runtime tokens;
+                # - the runner's command files, so that code from the
+                #   checkout cannot forge this step's outputs or summary,
+                #   or set the environment, PATH or state of later steps.
+                # Defence in depth, not a boundary: code running as the
+                # same user can still read an ancestor's environment and
+                # find the command files at their predictable paths.
+                scrubbed() {
+                  local -a unset_args=()
+                  local name
+                  for name in CARGO_REGISTRY_TOKEN \
+                    ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+                    ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN \
+                    GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+                    GITHUB_STEP_SUMMARY; do
+                    unset_args+=(-u "${name}")
+                  done
+                  while IFS= read -r name; do
+                    case "${name}" in
+                      CARGO_REGISTRIES_?*_TOKEN)
+                        unset_args+=(-u "${name}") ;;
+                    esac
+                  done < <(compgen -e)
+                  (cd -- "${PROJECT_DIR}" && \
+                    exec env "${unset_args[@]}" "$@")
+                }
+
+                # Sets backend_failure and returns non-zero on any
+                # failure; 'set -e' does not apply inside a function
+                # called as a condition, so every step checks itself.
+                cargo_generate() {
+                  local cdx_bin cli_bin reported ws_manifest lockfile
+                  local metadata project_manifest whole gen_name
+                  local member produced count serial hex
+                  local -a members=() docs=()
+
+                  # The binaries themselves, not 'cargo cyclonedx':
+                  # cargo resolves a subcommand through aliases in the
+                  # checkout's .cargo/config.toml and through PATH, so
+                  # the name could reach a different program. The
+                  # version check proves this is the one installed.
+                  cdx_bin="$(command -v cargo-cyclonedx || true)"
+                  reported=""
+                  if [ -n "${cdx_bin}" ]; then
+                    reported="$("${cdx_bin}" cyclonedx --version \
+                      2> /dev/null || true)"
+                  fi
+                  if [ "${reported##* }" != "${CARGO_CYCLONEDX_VERSION}" ]
+                  then
+                    backend_failure="cargo-cyclonedx"
+                    backend_failure+=" ${CARGO_CYCLONEDX_VERSION}"
+                    backend_failure+=" is not on PATH"
+                    return 1
+                  fi
+                  if [ "${SBOM_FORMAT}" != "json" ]; then
+                    cli_bin="$(command -v cyclonedx || true)"
+                    reported=""
+                    if [ -n "${cli_bin}" ]; then
+                      reported="$(DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+                        "${cli_bin}" --version 2> /dev/null || true)"
+                    fi
+                    if [ "${reported%%+*}" != "${CYCLONEDX_CLI_VERSION}" ]
+                    then
+                      backend_failure="cyclonedx-cli"
+                      backend_failure+=" ${CYCLONEDX_CLI_VERSION}"
+                      backend_failure+=" is not on PATH"
+                      return 1
+                    fi
+                  fi
+
+                  echo "Rust toolchain: $(scrubbed cargo --version || true)"
+                  if ! ws_manifest="$(scrubbed cargo locate-project \
+                    --workspace --message-format plain)"; then
+                    backend_failure="cargo could not locate the workspace"
+                    return 1
+                  fi
+
+                  # A missing lockfile is resolved for this run, with a
+                  # warning, and removed again: the SBOM then describes
+                  # what resolves today rather than what the project
+                  # pinned. A STALE one is an error. cargo-cyclonedx
+                  # would quietly rewrite it in the checkout (measured)
+                  # and describe a graph no build of this commit uses,
+                  # so cargo metadata --locked has to accept the
+                  # lockfile first.
+                  lockfile="$(dirname -- "${ws_manifest}")/Cargo.lock"
+                  if [ ! -e "${lockfile}" ] && [ ! -L "${lockfile}" ]; then
+                    echo "::warning::No Cargo.lock: the SBOM describes" \
+                      "dependencies as they resolve now; commit Cargo.lock" \
+                      "to describe a pinned graph"
+                    cargo_litter+=("${lockfile}")
+                    if ! scrubbed cargo generate-lockfile; then
+                      backend_failure="cargo could not resolve a lockfile"
+                      return 1
+                    fi
+                  fi
+                  metadata="${cargo_scratch}/metadata.json"
+                  if ! scrubbed cargo metadata --locked --format-version 1 \
+                    > "${metadata}"; then
+                    backend_failure="cargo metadata --locked failed; is"
+                    backend_failure+=" Cargo.lock up to date?"
+                    return 1
+                  fi
+
+                  # Member manifests, NUL-separated: a path may hold a
+                  # line break
+                  while IFS= read -r -d '' member; do
+                    members+=("${member}")
+                  done < <(jq -j '. as $m | $m.workspace_members[] as $id
+                    | $m.packages[] | select(.id == $id)
+                    | .manifest_path + "\u0000"' "${metadata}")
+                  if [ "${#members[@]}" -eq 0 ]; then
+                    backend_failure="cargo reported no workspace members"
+                    return 1
+                  fi
+
+                  # cargo-cyclonedx always describes every member of
+                  # the workspace, whichever manifest it is given
+                  # (measured), writing one document beside each
+                  # member's Cargo.toml under a name it derives; it has
+                  # no output directory. A random name keeps those
+                  # writes clear of project files, and every one is
+                  # registered for removal before it exists.
+                  hex="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+                  gen_name="sbom-action-${hex}"
+                  for member in "${members[@]}"; do
+                    cargo_litter+=("$(dirname -- "${member}")/${gen_name}.json")
+                  done
+
+                  # --target all by default: Cargo.lock serves every
+                  # platform and a crate ships to platforms the runner
+                  # is not, so describing the runner's alone would
+                  # leave platform-specific dependencies unscanned.
+                  # CARGO_BUILD_TARGET is removed because cargo-cyclonedx
+                  # 0.5.9 lets it override --target, 'all' included
+                  # (measured).
+                  #
+                  # include_dev maps onto build-dependencies, which run
+                  # on the build machine and never ship. cargo-cyclonedx
+                  # scopes them 'excluded' (transitive ones too) and
+                  # --no-build-deps drops them; it never records
+                  # dev-dependencies at all (measured).
+                  #
+                  # --describe stays at its default, crate (one
+                  # document per package): cargo-cyclonedx refuses it
+                  # alongside --override-filename.
+                  set -- --manifest-path "${PROJECT_DIR}/Cargo.toml" \
+                    --format json --spec-version "${SPEC_VERSION}" \
+                    --all --target "${CARGO_TARGET}" \
+                    --override-filename "${gen_name}" --quiet
+                  if [ "${INCLUDE_DEV}" != "true" ]; then
+                    set -- "$@" --no-build-deps
+                  else
+                    echo "::warning::cargo-cyclonedx records no" \
+                      "dev-dependencies; include_dev adds" \
+                      "build-dependencies only, scoped 'excluded'"
+                  fi
+                  echo "Generating SBOM with cargo-cyclonedx" \
+                    "${CARGO_CYCLONEDX_VERSION} (build-dependencies:" \
+                    "${INCLUDE_DEV}, target: ${CARGO_TARGET})"
+                  if ! scrubbed env -u CARGO_BUILD_TARGET \
+                    "${cdx_bin}" cyclonedx "$@"; then
+                    backend_failure="cargo-cyclonedx failed"
+                    return 1
+                  fi
+
+                  # The whole workspace when path_prefix holds its root
+                  # manifest, otherwise the one member it holds
+                  project_manifest="$(realpath -- "${PROJECT_DIR}/Cargo.toml")"
+                  whole="no"
+                  if [ "$(realpath -- "${ws_manifest}")" = \
+                    "${project_manifest}" ]; then
+                    whole="yes"
+                  fi
+                  for member in "${members[@]}"; do
+                    produced="$(dirname -- "${member}")/${gen_name}.json"
+                    if [ ! -f "${produced}" ] || [ -L "${produced}" ]; then
+                      backend_failure="cargo-cyclonedx wrote no document"
+                      backend_failure+=" for a member"
+                      return 1
+                    fi
+                    if [ "${whole}" = "yes" ] || [ "$(realpath -- \
+                      "${member}")" = "${project_manifest}" ]; then
+                      count="${#docs[@]}"
+                      docs+=("${cargo_scratch}/member-${count}.json")
+                      mv -- "${produced}" "${docs[-1]}"
+                    fi
+                  done
+                  if [ "${#docs[@]}" -eq 0 ]; then
+                    backend_failure="path_prefix names no workspace member"
+                    return 1
+                  fi
+                  echo "Workspace members described: ${#docs[@]}"
+
+                  if [ "${#docs[@]}" -eq 1 ]; then
+                    # One package: its document already names it in
+                    # metadata.component and hangs its direct
+                    # dependencies off it
+                    mv -- "${docs[0]}" "${json_path}"
+                  else
+                    # Several members: one document, in the shape
+                    # cyclonedx-maven gives a reactor. metadata.component
+                    # names the workspace, with no edges of its own;
+                    # every member is a top-level component WITHOUT a
+                    # scope (cargo-cyclonedx scopes metadata.component
+                    # 'required', so it is removed), and keeps its own
+                    # dependsOn; everything
+                    # else keeps the scope cargo-cyclonedx gave it,
+                    # the strongest where members disagree. bom-refs
+                    # are cargo package IDs, identical across the
+                    # per-member documents (measured), so components
+                    # and edges merge on them. A root that depended on
+                    # the members would make their own dependencies
+                    # look inherited to a reader anchoring on it.
+                    serial=""
+                    hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+                    if [ "${#hex}" -eq 32 ]; then
+                      serial="urn:uuid:${hex:0:8}-${hex:8:4}-4${hex:13:3}"
+                      serial="${serial}-$(printf '%x' \
+                        $(( (16#${hex:16:1} & 3) | 8 )))${hex:17:3}"
+                      serial="${serial}-${hex:20:12}"
+                    fi
+                    if ! jq -s --slurpfile meta "${metadata}" \
+                      --arg serial "${serial}" '
+                      def rank: {"required": 3, "optional": 2,
+                        "excluded": 1}[.scope // ""] // 0;
+                      . as $docs
+                      | $meta[0].workspace_root as $root
+                      | ("path+file://" + $root) as $root_ref
+                      | [$docs[].metadata.component["bom-ref"]] as $members
+                      | {bomFormat: "CycloneDX",
+                        specVersion: $docs[0].specVersion}
+                      + (if $docs[0].serialNumber and $serial != ""
+                        then {serialNumber: $serial} else {} end)
+                      + {version: 1,
+                        metadata: ($docs[0].metadata | .component = {
+                          type: "library", "bom-ref": $root_ref,
+                          name: ($root | split("/") | last)}),
+                        components: ([$docs[].metadata.component
+                            | del(.scope)]
+                          + ([$docs[].components[]?]
+                            | map(select(.["bom-ref"]
+                              | IN($members[]) | not))
+                            | group_by(.["bom-ref"])
+                            | map(max_by(rank)))),
+                        dependencies: ([{ref: $root_ref}]
+                          + ([$docs[].dependencies[]?]
+                            | group_by(.ref)
+                            | map({ref: .[0].ref}
+                              + ([.[].dependsOn[]?] | unique
+                                | if length > 0 then {dependsOn: .}
+                                  else {} end))))}' \
+                      "${docs[@]}" > "${json_path}"; then
+                      backend_failure="could not merge the workspace"
+                      backend_failure+=" documents"
+                      return 1
+                    fi
+                  fi
+
+                  # XML comes from the finished JSON document, so both
+                  # formats describe the same merge. Converting
+                  # cargo-cyclonedx's own JSON gives the same document
+                  # as its own XML (measured). Invariant globalisation
+                  # spares the .NET runtime a libicu dependency.
+                  if [ "${SBOM_FORMAT}" != "json" ]; then
+                    if ! DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+                      "${cli_bin}" convert --input-file "${json_path}" \
+                      --input-format json --output-file "${xml_path}" \
+                      --output-format xml \
+                      --output-version "v${SPEC_VERSION/./_}"; then
+                      backend_failure="cyclonedx-cli could not write XML"
+                      return 1
+                    fi
+                  fi
+                }
+
+                cargo_scratch="$(mktemp -d "${RUNNER_TEMP}/sbom-cargo.XXXXXX")"
+                backend_exit=0
+                if ! cargo_generate; then
+                  backend_exit=1
+                fi
+                ;;
             esac
             ;;
         esac
@@ -2065,7 +2487,10 @@ runs:
         # the failure mode this action exists to avoid.
         failure_reason=""
         if [ "${backend_exit}" != "0" ]; then
+          # A branch that knows why it failed says so; the exit code
+          # alone is the fallback
           failure_reason="${BACKEND} exited with code ${backend_exit}"
+          failure_reason="${backend_failure:-${failure_reason}}"
         fi
         # The cyclonedx backend's plugin honours cyclonedx.skip, which a
         # consumer POM can set as a property; it then exits 0 having
