@@ -56,7 +56,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -148,7 +148,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -270,7 +270,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -865,7 +865,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Block, like every other job here. Running a build tool that
       # resolves arbitrary plugins under unrestricted egress would make
@@ -1157,12 +1157,14 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Block, as everywhere else here. The shared allow-list carries
       # Maven Central, api.adoptium.net, services.gradle.org for the
-      # wrapper distribution, and plugins.gradle.org for the plugin
-      # itself, which resolves from the portal rather than Central.
+      # wrapper distribution, and both Gradle Plugin Portal hosts for
+      # the plugin itself, which resolves from the portal rather than
+      # Central: plugins.gradle.org serves the marker and 302-redirects
+      # the POM and JAR to plugins-artifacts.gradle.org.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
@@ -1419,13 +1421,13 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          # v0.16.6 rather than the v0.16.1 the other jobs load: it
-          # adds index.crates.io and static.crates.io, which cargo
-          # metadata reads dependency manifests from
-          config: '@538904e241556d101fb908b50e2a2965fa0346cf' # v0.16.6
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Block, like every other job here: cargo runs a rustc wrapper
       # from the checkout, which one fixture below does on purpose.
+      # The shared allow-list carries index.crates.io and
+      # static.crates.io, which cargo metadata reads dependency
+      # manifests from.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
@@ -1879,7 +1881,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
         with:
-          config: '@ec0736244fc776e326283c6af6840e30f316f63c' # v0.16.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
