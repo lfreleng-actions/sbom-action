@@ -280,6 +280,22 @@ steps:
       java_version: '21'
 ```
 
+For a Rust project built with features, describing the build those
+features produce:
+
+```yaml
+steps:
+  - name: "Generate SBOM"
+    id: sbom
+    uses: lfreleng-actions/sbom-action@main
+    with:
+      backend: 'cyclonedx'
+      dependency_manager: 'cargo'
+      path_prefix: '.'
+      cargo_features: 'serde, my-crate/tls'
+      cargo_no_default_features: 'true'
+```
+
 <!-- markdownlint-enable MD046 -->
 
 ## Requirements
@@ -394,20 +410,23 @@ them on every run so a typo surfaces regardless of the backend in use.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                    | Required | Default   | Description                                                      |
-| ----------------------- | -------- | --------- | ---------------------------------------------------------------- |
-| dependency_manager      | False    | `auto`    | Build tool: `auto`, `maven`, `gradle` or `cargo`                 |
-| java_version            | False    | `21`      | JDK version for the cyclonedx backend                            |
-| java_distribution       | False    | `temurin` | JDK distribution for the cyclonedx backend                       |
-| maven_plugin_version    | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer               |
-| maven_args              | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace  |
-| gradle_plugin_version   | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer              |
-| gradle_version          | False    | `''`      | Gradle version the project uses; empty asks the build tool       |
-| gradle_args             | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace |
-| cargo_cyclonedx_version | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                      |
-| cyclonedx_cli_version   | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo       |
-| cargo_target            | False    | `all`     | Cargo: `all` targets, or one target triple to describe           |
-| untrusted_checkout      | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`             |
+| Name                      | Required | Default   | Description                                                                               |
+| ------------------------- | -------- | --------- | ----------------------------------------------------------------------------------------- |
+| dependency_manager        | False    | `auto`    | Build tool: `auto`, `maven`, `gradle` or `cargo`                                          |
+| java_version              | False    | `21`      | JDK version for the cyclonedx backend                                                     |
+| java_distribution         | False    | `temurin` | JDK distribution for the cyclonedx backend                                                |
+| maven_plugin_version      | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer                                        |
+| maven_args                | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace                           |
+| gradle_plugin_version     | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer                                       |
+| gradle_version            | False    | `''`      | Gradle version the project uses; empty asks the build tool                                |
+| gradle_args               | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace                          |
+| cargo_cyclonedx_version   | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                                               |
+| cyclonedx_cli_version     | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo                                |
+| cargo_target              | False    | `all`     | Cargo: `all` targets, or one target triple to describe                                    |
+| cargo_features            | False    | `''`      | Cargo: features to activate, separated by whitespace or commas; `package/feature` allowed |
+| cargo_all_features        | False    | `false`   | Cargo: activate all features (`--all-features`)                                           |
+| cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                         |
+| untrusted_checkout        | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`                                      |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -573,6 +592,59 @@ removes `CARGO_BUILD_TARGET` from the tool's environment, because
 (measured). The document records the choice in
 `metadata.properties`, as `cdx:rustc:sbom:target:all_targets` or
 `cdx:rustc:sbom:target:triple`.
+
+**Features.** By default the document describes a build with default
+features, so a dependency behind any other feature is missing from it,
+and from any scan of it. Select the features the project ships with
+through `cargo_features`, `cargo_all_features` and
+`cargo_no_default_features`. They pass as `--features`,
+`--all-features` and `--no-default-features` to `cargo-cyclonedx` and
+to the `cargo metadata --locked` check of the lockfile before it, so
+that check covers the graph the selection resolves, and an offline
+cargo needs no sources outside that graph (measured). An input left at
+its default adds no flag, so both calls stay as before. The action
+normalises `cargo_features` to one comma-separated `--features`
+argument. Each entry has to be a feature name, optionally qualified by
+a package (`my-crate/tls`), matching what
+[rust-build-action](https://github.com/lfreleng-actions/rust-build-action)
+accepts, so one caller value works in both. Validation rejects
+anything else, and either boolean outside `true`/`false`, without
+repeating the value. The other dependency managers ignore all three, as
+they do `cargo_target`. The job summary reports the selection; the
+document itself does not record it.
+
+`cargo-cyclonedx` hands the flags to `cargo metadata`, which resolves
+them as `cargo build --workspace` with the same flags would
+from the `path_prefix` directory, errors included. Measured against
+`cargo-cyclonedx` 0.5.9 and cargo 1.90, on virtual and root-package
+workspaces under resolvers 1 and 2, with `path_prefix` at the root and
+at a member:
+
+<!-- markdownlint-disable MD013 -->
+
+| Selection                         | Applies to                                                              |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `cargo_features: tls`             | Every selected package that declares `tls`; the run fails if none does  |
+| `cargo_features: my-crate/tls`    | `my-crate` alone, wherever `path_prefix` points                         |
+| `cargo_no_default_features: true` | Every selected package                                                  |
+| `cargo_all_features: true`        | Every feature of every member; supersedes the other two, as in cargo    |
+
+<!-- markdownlint-enable MD013 -->
+
+The selected packages are every workspace member, except under
+resolver 1 when `path_prefix` holds a package, a root package or a
+member, which selects that package alone. A feature the named or
+selected packages lack fails the run with cargo's own error, rather
+than describing a different build.
+
+At a workspace root, the merged document then describes
+`cargo build --workspace` with those features. With `path_prefix` at a
+member of a resolver 2 workspace, the selection still spans the
+workspace, since `cargo-cyclonedx` always resolves every member: cargo
+accepts a feature that a sibling alone declares, where `cargo build`
+inside the member would reject it, and the member's document reflects
+whatever the selection does to the dependencies they share. To confine
+a selection to one member, qualify each feature with its package name.
 
 **Workspaces.** `cargo-cyclonedx` writes one document per workspace
 member, beside each member's `Cargo.toml`, whichever manifest the
@@ -1043,10 +1115,10 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version` and `cargo_target` inputs against restricted value sets before use; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
+1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features` and `cargo_no_default_features` inputs against restricted value sets before use; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
 2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java` for Maven and Gradle, or for Cargo installs `cargo-cyclonedx` (and `cyclonedx-cli` for XML output) via the pinned `taiki-e/install-action`. The selected backend and build tool guard each step, so none costs anything when unused
 3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
-4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary; in image mode, the image count, manifest, its path, and the list of files written
+4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary, which for Cargo names the feature selection; in image mode, the image count, manifest, its path, and the list of files written
 
 <!-- markdownlint-enable MD013 -->
 

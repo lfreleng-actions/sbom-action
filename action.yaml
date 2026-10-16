@@ -158,6 +158,21 @@ inputs:
     description: "Cargo projects: 'all' targets, or one target triple to describe"
     required: false
     default: "all"
+  cargo_features:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: features to activate, separated by whitespace or commas"
+    required: false
+    default: ""
+  cargo_all_features:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: activate all features ('true'/'false')"
+    required: false
+    default: "false"
+  cargo_no_default_features:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: do not activate default features ('true'/'false')"
+    required: false
+    default: "false"
 
 outputs:
   sbom_json_path:
@@ -230,6 +245,10 @@ runs:
         INPUT_CARGO_CYCLONEDX_VERSION: ${{ inputs.cargo_cyclonedx_version }}
         INPUT_CYCLONEDX_CLI_VERSION: ${{ inputs.cyclonedx_cli_version }}
         INPUT_CARGO_TARGET: ${{ inputs.cargo_target }}
+        INPUT_CARGO_FEATURES: ${{ inputs.cargo_features }}
+        INPUT_CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
+        # yamllint disable-line rule:line-length
+        INPUT_CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
         # Empty for every event that is not a pull request. Compared
         # against GITHUB_REPOSITORY (a default runner variable) to test
         # whether the head lives outside the base repository.
@@ -476,6 +495,41 @@ runs:
             echo "x86_64-unknown-linux-gnu"
             exit 1 ;;
         esac
+        case "${INPUT_CARGO_ALL_FEATURES}" in
+          true|false) ;;
+          *)
+            echo "Error: cargo_all_features must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_CARGO_NO_DEFAULT_FEATURES}" in
+          true|false) ;;
+          *)
+            echo "Error: cargo_no_default_features must be 'true' or" \
+              "'false' ❌"
+            exit 1 ;;
+        esac
+        # cargo_features reaches cargo-cyclonedx as one --features
+        # argument. Each entry is a feature name, optionally qualified
+        # by a package name: the pattern rust-build-action accepts, so
+        # one caller value is valid in both. The message names the
+        # input but never repeats its value, which could carry text the
+        # runner reads as a workflow command. Validated here, then
+        # handed on normalised to one comma-separated list.
+        cargo_feature_pattern='^([A-Za-z0-9_][A-Za-z0-9_-]*/)?'
+        cargo_feature_pattern+='[A-Za-z0-9_][A-Za-z0-9_+.-]*$'
+        cargo_features=()
+        read -r -a cargo_features \
+          <<< "${INPUT_CARGO_FEATURES//[$'\r\n\t,']/ }" || true
+        for feature in "${cargo_features[@]}"; do
+          if [[ ! "${feature}" =~ ${cargo_feature_pattern} ]]; then
+            echo "Error: invalid cargo_features ❌"
+            echo "Expected feature names such as 'serde' or"
+            echo "'my-crate/serde', separated by whitespace or commas"
+            exit 1
+          fi
+        done
+        echo "cargo_features=$(IFS=,; printf '%s' "${cargo_features[*]}")" \
+          >> "$GITHUB_OUTPUT"
         workspace="$(realpath -- "${GITHUB_WORKSPACE}")"
         # path_prefix plays no part in image mode, so it is neither
         # resolved nor checked there: a stale or absent value must not
@@ -922,6 +976,11 @@ runs:
         CARGO_CYCLONEDX_VERSION: ${{ inputs.cargo_cyclonedx_version }}
         CYCLONEDX_CLI_VERSION: ${{ inputs.cyclonedx_cli_version }}
         CARGO_TARGET: ${{ inputs.cargo_target }}
+        # The validated list, normalised to comma separation
+        CARGO_FEATURES: ${{ steps.validate.outputs.cargo_features }}
+        CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
+        # yamllint disable-line rule:line-length
+        CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
         # exposes them
@@ -2229,7 +2288,7 @@ runs:
                   local cdx_bin cli_bin reported ws_manifest lockfile
                   local metadata project_manifest whole gen_name
                   local member produced count serial hex
-                  local -a members=() docs=()
+                  local -a members=() docs=() feature_args=()
 
                   # The binaries themselves, not 'cargo cyclonedx':
                   # cargo resolves a subcommand through aliases in the
@@ -2291,11 +2350,37 @@ runs:
                       return 1
                     fi
                   fi
+                  # The feature selection as cargo flags, each only when
+                  # set, so the defaults leave both calls below as they
+                  # were. The preflight takes them too: it then checks
+                  # the graph the selection resolves, and an offline
+                  # cargo needs only that graph's sources (measured).
+                  # cargo-cyclonedx hands them to cargo metadata, which
+                  # resolves them as 'cargo build --workspace' would
+                  # from path_prefix (measured): workspace-wide under
+                  # resolver 2, an unknown feature rejected by cargo
+                  # itself. --all-features supersedes the other two, as
+                  # in cargo.
+                  if [ -n "${CARGO_FEATURES}" ]; then
+                    feature_args+=(--features "${CARGO_FEATURES}")
+                  fi
+                  if [ "${CARGO_ALL_FEATURES}" = "true" ]; then
+                    feature_args+=(--all-features)
+                  fi
+                  if [ "${CARGO_NO_DEFAULT_FEATURES}" = "true" ]; then
+                    feature_args+=(--no-default-features)
+                  fi
                   metadata="${cargo_scratch}/metadata.json"
                   if ! scrubbed cargo metadata --locked --format-version 1 \
-                    > "${metadata}"; then
+                    "${feature_args[@]}" > "${metadata}"; then
                     backend_failure="cargo metadata --locked failed; is"
-                    backend_failure+=" Cargo.lock up to date?"
+                    backend_failure+=" Cargo.lock up to date"
+                    if [ "${#feature_args[@]}" -gt 0 ]; then
+                      backend_failure+=", and does every cargo_features"
+                      backend_failure+=" entry name a feature cargo can"
+                      backend_failure+=" find"
+                    fi
+                    backend_failure+="?"
                     return 1
                   fi
 
@@ -2352,9 +2437,11 @@ runs:
                       "dev-dependencies; include_dev adds" \
                       "build-dependencies only, scoped 'excluded'"
                   fi
+                  set -- "$@" "${feature_args[@]}"
                   echo "Generating SBOM with cargo-cyclonedx" \
                     "${CARGO_CYCLONEDX_VERSION} (build-dependencies:" \
-                    "${INCLUDE_DEV}, target: ${CARGO_TARGET})"
+                    "${INCLUDE_DEV}, target: ${CARGO_TARGET}," \
+                    "features: ${cargo_selection})"
                   if ! scrubbed env -u CARGO_BUILD_TARGET \
                     "${cdx_bin}" cyclonedx "$@"; then
                     backend_failure="cargo-cyclonedx failed"
@@ -2471,6 +2558,20 @@ runs:
                   fi
                 }
 
+                # The feature selection in words, for the log and the
+                # job summary. Every part was validated, so it carries
+                # no markup the summary could misread.
+                if [ "${CARGO_ALL_FEATURES}" = "true" ]; then
+                  cargo_selection="all"
+                elif [ "${CARGO_NO_DEFAULT_FEATURES}" = "true" ]; then
+                  cargo_selection="no default"
+                else
+                  cargo_selection="default"
+                fi
+                if [ -n "${CARGO_FEATURES}" ]; then
+                  cargo_selection+=", plus ${CARGO_FEATURES}"
+                fi
+
                 cargo_scratch="$(mktemp -d "${RUNNER_TEMP}/sbom-cargo.XXXXXX")"
                 backend_exit=0
                 if ! cargo_generate; then
@@ -2555,6 +2656,9 @@ runs:
           echo "**Backend:** ${BACKEND}"
           if [ -n "${DEPENDENCY_MANAGER}" ]; then
             echo "**Build Tool:** ${DEPENDENCY_MANAGER}"
+          fi
+          if [ -n "${cargo_selection:-}" ]; then
+            echo "**Cargo Features:** \`${cargo_selection}\`"
           fi
           echo "**Format:** ${SBOM_FORMAT}"
           echo "**Specification Version:** ${SPEC_VERSION}"
