@@ -55,6 +55,8 @@ MANIFEST
 .venv*/
 .conda*/
 .python-version
+# Except where a test fixture pins its interpreter on purpose
+!tests/fixtures/**/.python-version
 
 # Node
 node_modules/*
