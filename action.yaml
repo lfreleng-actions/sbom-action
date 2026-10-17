@@ -186,6 +186,11 @@ inputs:
     description: "Cargo projects: do not activate default features ('true'/'false')"
     required: false
     default: "false"
+  cargo_working_directory:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: directory to run Cargo from, path_prefix or beneath it; empty runs it from path_prefix"
+    required: false
+    default: ""
 
   # Optional, python backend only
   python_version:
@@ -274,6 +279,8 @@ runs:
         INPUT_CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
         # yamllint disable-line rule:line-length
         INPUT_CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
+        # yamllint disable-line rule:line-length
+        INPUT_CARGO_WORKING_DIRECTORY: ${{ inputs.cargo_working_directory }}
         INPUT_PYTHON_VERSION: ${{ inputs.python_version }}
         INPUT_CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
         # Empty for every event that is not a pull request. Compared
@@ -506,6 +513,23 @@ runs:
             echo "uv, pdm, poetry, pipenv, pip-tools or pip"
             exit 1 ;;
         esac
+        # cargo_working_directory is refused, not ignored, wherever no
+        # Cargo runs. A caller sets it so that the SBOM follows the
+        # configuration a build in that directory reads; ignoring it
+        # would describe something else without a word. The backend and
+        # a declared dependency_manager settle it here, and a detected
+        # build tool once detection has run, below.
+        if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ]; then
+          case "${INPUT_BACKEND}:${INPUT_DEPENDENCY_MANAGER}" in
+            cyclonedx:auto|cyclonedx:cargo) ;;
+            *)
+              echo "Error: cargo_working_directory applies to Cargo" \
+                "projects only ❌"
+              echo "It needs backend 'cyclonedx', with dependency_manager"
+              echo "'cargo' or 'auto' resolving to Cargo"
+              exit 1 ;;
+          esac
+        fi
         # The Cargo tool versions reach taiki-e/install-action as
         # tool@version specifications, and cargo_target reaches the
         # command line, so all three get the whole-string treatment.
@@ -664,6 +688,43 @@ runs:
               echo "path_prefix must resolve within GITHUB_WORKSPACE"
               exit 1 ;;
           esac
+          # Cargo reads .cargo/config.toml, and rustup
+          # rust-toolchain.toml, from its working directory upward, so
+          # cargo_working_directory gets path_prefix's checks. It must
+          # also be path_prefix or lie beneath it: it selects
+          # configuration within the project described, never another
+          # tree's.
+          if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ]; then
+            cargo_dir="${INPUT_CARGO_WORKING_DIRECTORY}"
+            case "${cargo_dir}" in
+              /*) ;;
+              *) cargo_dir="${GITHUB_WORKSPACE}/${cargo_dir}" ;;
+            esac
+            if [ ! -d "${cargo_dir}" ]; then
+              echo "Error: invalid cargo_working_directory ❌"
+              printf 'Path not found: %s\n' \
+                "$(printf '%s' "${cargo_dir}" | tr -d '\r\n')"
+              exit 1
+            fi
+            cargo_dir="$(realpath -- "${cargo_dir}")"
+            case "${cargo_dir}/" in
+              "${workspace}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory escapes the" \
+                  "workspace ❌"
+                echo "It must resolve within GITHUB_WORKSPACE"
+                exit 1 ;;
+            esac
+            case "${cargo_dir}/" in
+              "${resolved}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory lies outside" \
+                  "path_prefix ❌"
+                echo "It must resolve to path_prefix or a directory"
+                echo "beneath it"
+                exit 1 ;;
+            esac
+          fi
         fi
         # The archive directory is read rather than written, but it gets
         # the output_directory boundary all the same: syft records what
@@ -974,6 +1035,16 @@ runs:
             exit 1
           fi
         fi
+        # The detected build tool, for cargo_working_directory (see
+        # above). A skipped run detects none and runs no Cargo either.
+        if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ] && \
+          [ "${skipped}" != "true" ] && \
+          [ "${dependency_manager}" != "cargo" ]; then
+          echo "Error: cargo_working_directory applies to Cargo" \
+            "projects only ❌"
+          echo "The build tool detected is ${dependency_manager}"
+          exit 1
+        fi
         echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
 
         # The tools a Cargo run installs, as taiki-e/install-action
@@ -1176,6 +1247,8 @@ runs:
         CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
         # yamllint disable-line rule:line-length
         CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
+        # yamllint disable-line rule:line-length
+        CARGO_WORKING_DIRECTORY: ${{ inputs.cargo_working_directory }}
         PYTHON_CMD: ${{ steps.python.outputs.python-path }}
         PYTHON_VERSION: ${{ inputs.python_version }}
         CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
@@ -1209,6 +1282,28 @@ runs:
               echo "path_prefix must resolve within GITHUB_WORKSPACE"
               exit 1 ;;
           esac
+          # Where Cargo runs: path_prefix, unless cargo_working_directory
+          # names a directory, which is re-resolved here for the same
+          # reason. path_prefix lies within the workspace, so lying
+          # beneath it is the whole test.
+          CARGO_DIR="${PROJECT_DIR}"
+          if [ -n "${CARGO_WORKING_DIRECTORY}" ]; then
+            CARGO_DIR="${CARGO_WORKING_DIRECTORY}"
+            case "${CARGO_DIR}" in
+              /*) ;;
+              *) CARGO_DIR="${GITHUB_WORKSPACE:?}/${CARGO_DIR}" ;;
+            esac
+            CARGO_DIR="$(realpath -- "${CARGO_DIR}")"
+            case "${CARGO_DIR}/" in
+              "${PROJECT_DIR}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory lies outside" \
+                  "path_prefix ❌"
+                echo "It must resolve to path_prefix or a directory"
+                echo "beneath it"
+                exit 1 ;;
+            esac
+          fi
         fi
         # Convert the output directory to an absolute path anchored
         # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
@@ -1945,7 +2040,7 @@ runs:
 
         backend_failure=""
 
-        # Runs a command from the project directory, for the backends
+        # Runs a command from the directory given first, for the backends
         # that execute code from the checkout or from the packages it
         # names (Cargo through a rustc wrapper, Python through build
         # backends and .pth files), without:
@@ -1962,7 +2057,9 @@ runs:
         # Defence in depth, not a boundary: code running as the same
         # user can still read an ancestor's environment and find the
         # command files at their predictable paths.
-        scrubbed() {
+        scrubbed_in() {
+          local dir="$1"
+          shift
           local -a unset_args=()
           local name
           for name in CARGO_REGISTRY_TOKEN TWINE_PASSWORD \
@@ -1980,8 +2077,12 @@ runs:
                 unset_args+=(-u "${name}") ;;
             esac
           done < <(compgen -e)
-          (cd -- "${PROJECT_DIR}" && \
+          (cd -- "${dir}" && \
             exec env "${unset_args[@]}" "$@")
+        }
+        # The same, from the project directory
+        scrubbed() {
+          scrubbed_in "${PROJECT_DIR}" "$@"
         }
 
         case "${BACKEND}" in
@@ -2492,9 +2593,13 @@ runs:
                 # (measured), and rust-toolchain.toml can select a
                 # toolchain directory inside the checkout. The
                 # untrusted-checkout skip covers Cargo for that reason,
-                # and every cargo call goes through scrubbed (above),
-                # so rustup selects the toolchain the project's
-                # rust-toolchain.toml names.
+                # and every cargo call goes through scrubbed_in (above)
+                # from CARGO_DIR: path_prefix, or cargo_working_directory
+                # where one is given. Cargo reads .cargo/config.toml, and
+                # rustup rust-toolchain.toml, from there upward, so the
+                # SBOM follows the configuration a build run from that
+                # directory sees, while path_prefix still decides the
+                # manifest described.
 
                 # Sets backend_failure and returns non-zero on any
                 # failure; 'set -e' does not apply inside a function
@@ -2504,6 +2609,7 @@ runs:
                   local metadata project_manifest whole gen_name
                   local member produced count serial hex
                   local -a members=() docs=() feature_args=()
+                  local -a manifest_args=()
 
                   # The binaries themselves, not 'cargo cyclonedx':
                   # cargo resolves a subcommand through aliases in the
@@ -2539,9 +2645,20 @@ runs:
                     fi
                   fi
 
-                  echo "Rust toolchain: $(scrubbed cargo --version || true)"
-                  if ! ws_manifest="$(scrubbed cargo locate-project \
-                    --workspace --message-format plain)"; then
+                  # From cargo_working_directory, cargo would look for a
+                  # manifest from there upward, so each call that does
+                  # not name one already names path_prefix's. Unset,
+                  # Cargo runs from path_prefix and no call changes.
+                  if [ -n "${CARGO_WORKING_DIRECTORY}" ]; then
+                    manifest_args=(--manifest-path "${PROJECT_DIR}/Cargo.toml")
+                    printf 'Cargo working directory: %s\n' \
+                      "$(printf '%s' "${CARGO_DIR}" | tr -d '\r\n')"
+                  fi
+                  echo "Rust toolchain: $(scrubbed_in "${CARGO_DIR}" \
+                    cargo --version || true)"
+                  if ! ws_manifest="$(scrubbed_in "${CARGO_DIR}" \
+                    cargo locate-project --workspace --message-format plain \
+                    "${manifest_args[@]}")"; then
                     backend_failure="cargo could not locate the workspace"
                     return 1
                   fi
@@ -2560,7 +2677,8 @@ runs:
                       "dependencies as they resolve now; commit Cargo.lock" \
                       "to describe a pinned graph"
                     cargo_litter+=("${lockfile}")
-                    if ! scrubbed cargo generate-lockfile; then
+                    if ! scrubbed_in "${CARGO_DIR}" cargo generate-lockfile \
+                      "${manifest_args[@]}"; then
                       backend_failure="cargo could not resolve a lockfile"
                       return 1
                     fi
@@ -2586,7 +2704,8 @@ runs:
                     feature_args+=(--no-default-features)
                   fi
                   metadata="${cargo_scratch}/metadata.json"
-                  if ! scrubbed cargo metadata --locked --format-version 1 \
+                  if ! scrubbed_in "${CARGO_DIR}" cargo metadata --locked \
+                    --format-version 1 "${manifest_args[@]}" \
                     "${feature_args[@]}" > "${metadata}"; then
                     backend_failure="cargo metadata --locked failed; is"
                     backend_failure+=" Cargo.lock up to date"
@@ -2657,7 +2776,7 @@ runs:
                     "${CARGO_CYCLONEDX_VERSION} (build-dependencies:" \
                     "${INCLUDE_DEV}, target: ${CARGO_TARGET}," \
                     "features: ${cargo_selection})"
-                  if ! scrubbed env -u CARGO_BUILD_TARGET \
+                  if ! scrubbed_in "${CARGO_DIR}" env -u CARGO_BUILD_TARGET \
                     "${cdx_bin}" cyclonedx "$@"; then
                     backend_failure="cargo-cyclonedx failed"
                     return 1
