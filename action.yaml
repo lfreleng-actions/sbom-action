@@ -7,12 +7,12 @@ name: "📋 SBOM Generator"
 # yamllint disable-line rule:line-length
 description: "Generates CycloneDX SBOM reports for projects and container images"
 # Facade action: a common interface over pluggable SBOM generation
-# backends. The interface deliberately mirrors python-sbom-action so
-# callers see one contract across the actions estate. The syft backend
-# performs static analysis of lockfiles/filesystem content and covers
-# Go, Node.js, containers, binaries and many further ecosystems in a
-# single tool. Future backends (cyclonedx-npm, cyclonedx-gomod, an
-# environment-based python backend) can slot in behind the same
+# backends. The interface began as a mirror of python-sbom-action, which
+# the python backend below now replaces, so callers see one contract
+# across the actions estate. The syft backend performs static analysis
+# of lockfiles/filesystem content and covers Go, Node.js, containers,
+# binaries and many further ecosystems in a single tool. Future
+# backends (cyclonedx-npm, cyclonedx-gomod) can slot in behind the same
 # interface when evidence shows a need for them.
 #
 # Backends name the TOOL that produces the document, not the build
@@ -39,6 +39,18 @@ description: "Generates CycloneDX SBOM reports for projects and container images
 # it can leave out dev-dependencies, scope build-dependencies and emit
 # the dependency graph a scanner needs to tell direct from inherited.
 #
+# The python backend is the one named for an ecosystem rather than a
+# tool, and deliberately so. Its tool, cyclonedx-py, reads an INSTALLED
+# environment rather than driving a build tool's resolver, so the
+# action has to build that environment first with whichever package
+# manager the project uses (uv, PDM, Poetry, Pipenv or pip), and the
+# backend owns that whole sequence: lock check, install, then scan.
+# Keeping it apart from the cyclonedx backend also keeps its detection
+# apart: a Python project often carries a Cargo.toml (PyO3, maturin)
+# that the cyclonedx backend's detection would claim. It absorbed
+# python-sbom-action, keeping its inputs, its dependency_manager values
+# and its detection order, so callers can switch with a backend input.
+#
 # mode selects WHAT the document describes, independently of the
 # backend: 'directory' (the default) scans path_prefix, and 'image'
 # writes one SBOM per container image from docker archives. Image mode
@@ -52,7 +64,7 @@ description: "Generates CycloneDX SBOM reports for projects and container images
 inputs:
   # Optional
   backend:
-    description: "SBOM generation backend: 'syft' or 'cyclonedx'"
+    description: "SBOM generation backend: 'syft', 'cyclonedx' or 'python'"
     required: false
     default: "syft"
   path_prefix:
@@ -86,7 +98,7 @@ inputs:
     default: "."
   include_dev:
     # yamllint disable-line rule:line-length
-    description: "Include development dependencies (Maven test scope, Gradle test configurations, Cargo build-dependencies) in SBOM"
+    description: "Include development dependencies (Maven test scope, Gradle test configurations, Cargo build-dependencies, Python dev groups) in SBOM"
     required: false
     default: "false"
   fail_on_error:
@@ -98,6 +110,17 @@ inputs:
     description: "Syft version to download (defaults to the installer's pinned version)"
     required: false
     default: ""
+  # Optional, cyclonedx and python backends
+  untrusted_checkout:
+    # yamllint disable-line rule:line-length
+    description: "Is the checkout untrusted: 'auto', 'true' or 'false'"
+    required: false
+    default: "auto"
+  dependency_manager:
+    # yamllint disable-line rule:line-length
+    description: "Build tool or package manager to drive: 'auto'; 'maven', 'gradle' or 'cargo' (cyclonedx); 'uv', 'pdm', 'poetry', 'pipenv', 'pip-tools' or 'pip' (python)"
+    required: false
+    default: "auto"
 
   # Optional, cyclonedx backend only
   java_version:
@@ -118,16 +141,6 @@ inputs:
     description: "Extra arguments appended to the Maven call, split on whitespace"
     required: false
     default: ""
-  untrusted_checkout:
-    # yamllint disable-line rule:line-length
-    description: "Is the checkout untrusted: 'auto', 'true' or 'false'"
-    required: false
-    default: "auto"
-  dependency_manager:
-    # yamllint disable-line rule:line-length
-    description: "Build tool for the cyclonedx backend: 'auto', 'maven', 'gradle' or 'cargo'"
-    required: false
-    default: "auto"
   gradle_plugin_version:
     # yamllint disable-line rule:line-length
     description: "cyclonedx-gradle-plugin version; 3.0.0 or newer"
@@ -173,6 +186,23 @@ inputs:
     description: "Cargo projects: do not activate default features ('true'/'false')"
     required: false
     default: "false"
+  cargo_working_directory:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: directory to run Cargo from, path_prefix or beneath it; empty runs it from path_prefix"
+    required: false
+    default: ""
+
+  # Optional, python backend only
+  python_version:
+    # yamllint disable-line rule:line-length
+    description: "Python for the python backend's tools and environment; 3.10 or newer"
+    required: false
+    default: "3.12"
+  cyclonedx_py_version:
+    # yamllint disable-line rule:line-length
+    description: "cyclonedx-bom version for the python backend; 4.0.0 or newer"
+    required: false
+    default: "7.5.0"
 
 outputs:
   sbom_json_path:
@@ -189,7 +219,7 @@ outputs:
     value: ${{ steps.validate.outputs.backend }}
   dependency_manager:
     # yamllint disable-line rule:line-length
-    description: "Build tool the cyclonedx backend drove; empty for syft"
+    description: "Build tool or package manager the backend drove; empty for syft"
     value: ${{ steps.validate.outputs.dependency_manager }}
   skipped:
     # yamllint disable-line rule:line-length
@@ -249,6 +279,10 @@ runs:
         INPUT_CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
         # yamllint disable-line rule:line-length
         INPUT_CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
+        # yamllint disable-line rule:line-length
+        INPUT_CARGO_WORKING_DIRECTORY: ${{ inputs.cargo_working_directory }}
+        INPUT_PYTHON_VERSION: ${{ inputs.python_version }}
+        INPUT_CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
         # Empty for every event that is not a pull request. Compared
         # against GITHUB_REPOSITORY (a default runner variable) to test
         # whether the head lives outside the base repository.
@@ -299,10 +333,10 @@ runs:
           fi
         done
         case "${INPUT_BACKEND}" in
-          syft|cyclonedx) ;;
+          syft|cyclonedx|python) ;;
           *)
             echo "Error: unsupported backend ❌"
-            echo "Supported backends: syft, cyclonedx"
+            echo "Supported backends: syft, cyclonedx, python"
             exit 1 ;;
         esac
         case "${INPUT_MODE}" in
@@ -456,11 +490,46 @@ runs:
         esac
         case "${INPUT_DEPENDENCY_MANAGER}" in
           auto|maven|gradle|cargo) ;;
+          uv|pdm|poetry|pipenv|pip-tools|pip) ;;
           *)
             echo "Error: dependency_manager must be 'auto', 'maven'," \
-              "'gradle' or 'cargo' ❌"
+              "'gradle', 'cargo', 'uv', 'pdm', 'poetry', 'pipenv'," \
+              "'pip-tools' or 'pip' ❌"
             exit 1 ;;
         esac
+        # Each backend drives its own tools, so a declared value has to
+        # belong to the backend selected. syft drives none and ignores
+        # the input, as it always has.
+        case "${INPUT_BACKEND}:${INPUT_DEPENDENCY_MANAGER}" in
+          syft:*|*:auto) ;;
+          cyclonedx:maven|cyclonedx:gradle|cyclonedx:cargo) ;;
+          python:uv|python:pdm|python:poetry|python:pipenv) ;;
+          python:pip-tools|python:pip) ;;
+          *)
+            echo "Error: dependency_manager" \
+              "'${INPUT_DEPENDENCY_MANAGER}' does not belong to the" \
+              "${INPUT_BACKEND} backend ❌"
+            echo "cyclonedx drives maven, gradle or cargo; python drives"
+            echo "uv, pdm, poetry, pipenv, pip-tools or pip"
+            exit 1 ;;
+        esac
+        # cargo_working_directory is refused, not ignored, wherever no
+        # Cargo runs. A caller sets it so that the SBOM follows the
+        # configuration a build in that directory reads; ignoring it
+        # would describe something else without a word. The backend and
+        # a declared dependency_manager settle it here, and a detected
+        # build tool once detection has run, below.
+        if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ]; then
+          case "${INPUT_BACKEND}:${INPUT_DEPENDENCY_MANAGER}" in
+            cyclonedx:auto|cyclonedx:cargo) ;;
+            *)
+              echo "Error: cargo_working_directory applies to Cargo" \
+                "projects only ❌"
+              echo "It needs backend 'cyclonedx', with dependency_manager"
+              echo "'cargo' or 'auto' resolving to Cargo"
+              exit 1 ;;
+          esac
+        fi
         # The Cargo tool versions reach taiki-e/install-action as
         # tool@version specifications, and cargo_target reaches the
         # command line, so all three get the whole-string treatment.
@@ -530,6 +599,62 @@ runs:
         done
         echo "cargo_features=$(IFS=,; printf '%s' "${cargo_features[*]}")" \
           >> "$GITHUB_OUTPUT"
+        # python_version reaches setup-python, and cyclonedx_py_version a
+        # pip requirement specifier, where a stray operator or marker
+        # would change what gets installed. Validated on every run, like
+        # the inputs above. setup-python's '3' and '3.x' forms stay
+        # usable.
+        case "${INPUT_PYTHON_VERSION}" in
+          *[!0-9.x]*|''|.*|*.|*..*)
+            echo "Error: invalid python_version ❌"
+            echo "Expected a Python version such as 3.12 or 3.x"
+            exit 1 ;;
+        esac
+        # Python 3.10 is the floor: every older release is end of life,
+        # and the package managers this backend installs (pip, uv, PDM,
+        # Poetry, Pipenv) require 3.10 in their current releases. The
+        # minor version is compared as a number, so 3.10 passes and 3.9
+        # does not; '3' and '3.x' ask for the newest 3.x and pass too.
+        python_supported="no"
+        case "${INPUT_PYTHON_VERSION}" in
+          3|3.x) python_supported="yes" ;;
+          3.[0-9]*)
+            python_minor="${INPUT_PYTHON_VERSION#3.}"
+            python_minor="${python_minor%%.*}"
+            case "${python_minor}" in
+              *[!0-9]*) ;;
+              *)
+                if [ "${python_minor}" -ge 10 ]; then
+                  python_supported="yes"
+                fi ;;
+            esac ;;
+        esac
+        if [ "${python_supported}" != "yes" ]; then
+          echo "Error: python_version is below the supported floor ❌"
+          echo "Minimum supported: 3.10"
+          echo "Earlier releases are end of life, and the package"
+          echo "managers this backend installs require 3.10"
+          exit 1
+        fi
+        case "${INPUT_CYCLONEDX_PY_VERSION}" in
+          *[!0-9.]*|''|.*|*.|*..*)
+            echo "Error: invalid cyclonedx_py_version ❌"
+            echo "Expected a version such as 7.5.0"
+            exit 1 ;;
+        esac
+        # 4.0.0 introduced the subcommand CLI the backend calls:
+        # 'environment' with a target interpreter, --pyproject, --sv and
+        # --of. Earlier releases have none of it. Verified against the
+        # help output of 4.0.0, 5.0.0, 6.0.0 and 7.5.0.
+        cyclonedx_py_minimum="4.0.0"
+        oldest="$(printf '%s\n%s\n' "${INPUT_CYCLONEDX_PY_VERSION}" \
+          "${cyclonedx_py_minimum}" | sort -V | head -1)"
+        if [ "${oldest}" != "${cyclonedx_py_minimum}" ]; then
+          echo "Error: cyclonedx_py_version is too old ❌"
+          echo "Minimum supported: ${cyclonedx_py_minimum}"
+          echo "Earlier releases lack the 'environment' subcommand"
+          exit 1
+        fi
         workspace="$(realpath -- "${GITHUB_WORKSPACE}")"
         # path_prefix plays no part in image mode, so it is neither
         # resolved nor checked there: a stale or absent value must not
@@ -563,6 +688,43 @@ runs:
               echo "path_prefix must resolve within GITHUB_WORKSPACE"
               exit 1 ;;
           esac
+          # Cargo reads .cargo/config.toml, and rustup
+          # rust-toolchain.toml, from its working directory upward, so
+          # cargo_working_directory gets path_prefix's checks. It must
+          # also be path_prefix or lie beneath it: it selects
+          # configuration within the project described, never another
+          # tree's.
+          if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ]; then
+            cargo_dir="${INPUT_CARGO_WORKING_DIRECTORY}"
+            case "${cargo_dir}" in
+              /*) ;;
+              *) cargo_dir="${GITHUB_WORKSPACE}/${cargo_dir}" ;;
+            esac
+            if [ ! -d "${cargo_dir}" ]; then
+              echo "Error: invalid cargo_working_directory ❌"
+              printf 'Path not found: %s\n' \
+                "$(printf '%s' "${cargo_dir}" | tr -d '\r\n')"
+              exit 1
+            fi
+            cargo_dir="$(realpath -- "${cargo_dir}")"
+            case "${cargo_dir}/" in
+              "${workspace}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory escapes the" \
+                  "workspace ❌"
+                echo "It must resolve within GITHUB_WORKSPACE"
+                exit 1 ;;
+            esac
+            case "${cargo_dir}/" in
+              "${resolved}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory lies outside" \
+                  "path_prefix ❌"
+                echo "It must resolve to path_prefix or a directory"
+                echo "beneath it"
+                exit 1 ;;
+            esac
+          fi
         fi
         # The archive directory is read rather than written, but it gets
         # the output_directory boundary all the same: syft records what
@@ -624,9 +786,12 @@ runs:
         #
         # The cyclonedx backend runs the project's own build tool,
         # which loads .mvn/extensions.xml, POM build extensions and
-        # .mvn/maven.config from the CHECKOUT as code. No flag
-        # disables that, so the only control available is whether to
-        # run the backend at all.
+        # .mvn/maven.config from the CHECKOUT as code. The python
+        # backend installs the project's dependencies, which runs build
+        # backends (setup.py among them) for anything without a wheel,
+        # and its interpreter executes the .pth files those packages
+        # install. No flag disables any of that, so the only control
+        # available is whether to run the backend at all.
         #
         # 'auto' detects the case this action can see for itself: a
         # pull request whose head lives outside the base repository.
@@ -683,10 +848,12 @@ runs:
         # previously generated sbom-cyclonedx.* would survive the skip
         # and be published by the caller's artifact glob.
         skipped="false"
-        if [ "${INPUT_BACKEND}" = "cyclonedx" ] && \
-          [ "${untrusted}" = "true" ]; then
-          skipped="true"
-        fi
+        case "${INPUT_BACKEND}" in
+          cyclonedx|python)
+            if [ "${untrusted}" = "true" ]; then
+              skipped="true"
+            fi ;;
+        esac
 
         skip_reason=""
         if [ "${skipped}" = "true" ]; then
@@ -792,6 +959,91 @@ runs:
                   exit 1 ;;
               esac ;;
           esac
+        fi
+
+        # The python backend's package manager, resolved the same way:
+        # a declared value wins and must describe the checkout, and
+        # 'auto' reads the files present. The order is
+        # python-sbom-action's, unchanged, so a project resolves to the
+        # manager it always did and dependency_manager reports the same
+        # value: a lock file outranks any requirements file, and a
+        # pyproject.toml without either comes last.
+        #
+        # pip-tools and pip install identically; the split only reports
+        # whether requirements.txt looks compiled (pins with ==, or a
+        # requirements.in beside it), which is what decides whether the
+        # result describes a pinned set.
+        if [ "${INPUT_BACKEND}" = "python" ] && \
+          [ "${skipped}" != "true" ]; then
+          compiled_requirements="no"
+          if [ -f "${resolved}/requirements.txt" ] && \
+            { grep -qF -- '==' "${resolved}/requirements.txt" || \
+              [ -f "${resolved}/requirements.in" ]; }; then
+            compiled_requirements="yes"
+          fi
+          if [ "${INPUT_DEPENDENCY_MANAGER}" != "auto" ]; then
+            dependency_manager="${INPUT_DEPENDENCY_MANAGER}"
+            echo "Caller supplied package manager: ${dependency_manager}"
+          elif [ -f "${resolved}/uv.lock" ]; then
+            dependency_manager="uv"
+          elif [ -f "${resolved}/pdm.lock" ]; then
+            dependency_manager="pdm"
+          elif [ -f "${resolved}/poetry.lock" ]; then
+            dependency_manager="poetry"
+          elif [ -f "${resolved}/Pipfile.lock" ]; then
+            dependency_manager="pipenv"
+          elif [ "${compiled_requirements}" = "yes" ]; then
+            dependency_manager="pip-tools"
+          elif [ -f "${resolved}/requirements.txt" ] || \
+            [ -f "${resolved}/pyproject.toml" ]; then
+            dependency_manager="pip"
+          else
+            echo "Error: no Python project found ❌"
+            echo "The python backend needs one of uv.lock, pdm.lock,"
+            echo "poetry.lock, Pipfile.lock, requirements.txt or"
+            echo "pyproject.toml in the project directory"
+            exit 1
+          fi
+          if [ "${INPUT_DEPENDENCY_MANAGER}" = "auto" ]; then
+            echo "Detected package manager: ${dependency_manager}"
+          fi
+
+          # Each manager installs from a particular file, so a declared
+          # value has to find it rather than failing deep inside the
+          # tool. pip-tools names a requirements file specifically.
+          required_files=""
+          case "${dependency_manager}" in
+            uv) required_files="uv.lock" ;;
+            pdm) required_files="pdm.lock" ;;
+            poetry) required_files="poetry.lock" ;;
+            pipenv) required_files="Pipfile.lock" ;;
+            pip-tools) required_files="requirements.txt" ;;
+            pip) required_files="requirements.txt pyproject.toml" ;;
+          esac
+          found_file=""
+          for candidate in ${required_files}; do
+            if [ -f "${resolved}/${candidate}" ]; then
+              found_file="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${found_file}" ]; then
+            echo "Error: no ${required_files// / or } in the project" \
+              "directory ❌"
+            echo "dependency_manager is '${dependency_manager}' but the"
+            echo "checkout carries nothing for it to install from"
+            exit 1
+          fi
+        fi
+        # The detected build tool, for cargo_working_directory (see
+        # above). A skipped run detects none and runs no Cargo either.
+        if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ] && \
+          [ "${skipped}" != "true" ] && \
+          [ "${dependency_manager}" != "cargo" ]; then
+          echo "Error: cargo_working_directory applies to Cargo" \
+            "projects only ❌"
+          echo "The build tool detected is ${dependency_manager}"
+          exit 1
         fi
         echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
 
@@ -923,6 +1175,20 @@ runs:
         tool: ${{ steps.validate.outputs.cargo_tools }}
         fallback: none
 
+    # The python backend creates its environments from this
+    # interpreter. update-environment is off so the caller's job keeps
+    # whatever Python it had: the action reads the interpreter from the
+    # python-path output instead of PATH, and installs nothing into it.
+    - name: "Set up Python"
+      id: python
+      # yamllint disable-line rule:line-length
+      if: ${{ inputs.backend == 'python' && steps.validate.outputs.skipped != 'true' }}
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python_version }}
+        update-environment: false
+
     - name: "Generate SBOM"
       id: generate
       # Runs even for a skipped backend: the destination files must be
@@ -981,6 +1247,11 @@ runs:
         CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
         # yamllint disable-line rule:line-length
         CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
+        # yamllint disable-line rule:line-length
+        CARGO_WORKING_DIRECTORY: ${{ inputs.cargo_working_directory }}
+        PYTHON_CMD: ${{ steps.python.outputs.python-path }}
+        PYTHON_VERSION: ${{ inputs.python_version }}
+        CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
         # exposes them
@@ -1011,6 +1282,28 @@ runs:
               echo "path_prefix must resolve within GITHUB_WORKSPACE"
               exit 1 ;;
           esac
+          # Where Cargo runs: path_prefix, unless cargo_working_directory
+          # names a directory, which is re-resolved here for the same
+          # reason. path_prefix lies within the workspace, so lying
+          # beneath it is the whole test.
+          CARGO_DIR="${PROJECT_DIR}"
+          if [ -n "${CARGO_WORKING_DIRECTORY}" ]; then
+            CARGO_DIR="${CARGO_WORKING_DIRECTORY}"
+            case "${CARGO_DIR}" in
+              /*) ;;
+              *) CARGO_DIR="${GITHUB_WORKSPACE:?}/${CARGO_DIR}" ;;
+            esac
+            CARGO_DIR="$(realpath -- "${CARGO_DIR}")"
+            case "${CARGO_DIR}/" in
+              "${PROJECT_DIR}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory lies outside" \
+                  "path_prefix ❌"
+                echo "It must resolve to path_prefix or a directory"
+                echo "beneath it"
+                exit 1 ;;
+            esac
+          fi
         fi
         # Convert the output directory to an absolute path anchored
         # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
@@ -1685,15 +1978,21 @@ runs:
           echo "::warning::SBOM generation skipped: the ${BACKEND}" \
             "backend executes code from the checkout, which is not" \
             "trusted here"
+          if [ "${BACKEND}" = "python" ]; then
+            executes="installs the project's dependencies, which runs"
+            executes="${executes} build code from the checkout and the"
+            executes="${executes} packages it names"
+          else
+            executes="runs the project's build tool, which loads build"
+            executes="${executes} configuration from the checkout as code"
+          fi
           {
             echo "## 📋 SBOM Generation Results"
             echo ""
             echo "SBOM generation skipped ⏭️"
             echo ""
-            echo "The \`${BACKEND}\` backend runs the project's build"
-            echo "tool, which loads build configuration from the"
-            echo "checkout as code. This checkout is untrusted, so no"
-            echo "SBOM was produced."
+            echo "The \`${BACKEND}\` backend ${executes}. This checkout"
+            echo "is untrusted, so no SBOM was produced."
             echo ""
             echo "No document was written and no counts are reported:"
             echo "a partial or lower-fidelity SBOM would read as a"
@@ -1721,6 +2020,7 @@ runs:
         scratch_dir=""
         gradle_scratch=""
         cargo_scratch=""
+        python_scratch=""
         # Files a Cargo run creates inside the checkout, removed on the
         # way out so the tree is left as the run found it
         cargo_litter=()
@@ -1728,6 +2028,7 @@ runs:
           [ -z "${scratch_dir}" ] || rm -rf -- "${scratch_dir}"
           [ -z "${gradle_scratch}" ] || rm -rf -- "${gradle_scratch}"
           [ -z "${cargo_scratch}" ] || rm -rf -- "${cargo_scratch}"
+          [ -z "${python_scratch}" ] || rm -rf -- "${python_scratch}"
           [ "${#cargo_litter[@]}" -eq 0 ] || rm -f -- "${cargo_litter[@]}"
         }
         trap cleanup_scratch EXIT
@@ -1738,6 +2039,52 @@ runs:
         fi
 
         backend_failure=""
+
+        # Runs a command from the directory given first, for the backends
+        # that execute code from the checkout or from the packages it
+        # names (Cargo through a rustc wrapper, Python through build
+        # backends and .pth files), without:
+        # - publishing credentials: CARGO_REGISTRY_TOKEN and every
+        #   CARGO_REGISTRIES_<NAME>_TOKEN, every POETRY_PYPI_TOKEN_<NAME>,
+        #   TWINE_PASSWORD, UV_PUBLISH_TOKEN, UV_PUBLISH_PASSWORD,
+        #   PDM_PUBLISH_PASSWORD, FLIT_PASSWORD and HATCH_INDEX_AUTH.
+        #   Resolution settings stay, such as CARGO_REGISTRIES_<NAME>_INDEX
+        #   or PIP_INDEX_URL, since a private registry may need them;
+        # - the GitHub OIDC and runtime tokens;
+        # - the runner's command files, so that code from the checkout
+        #   cannot forge this step's outputs or summary, or set the
+        #   environment, PATH or state of later steps.
+        # Defence in depth, not a boundary: code running as the same
+        # user can still read an ancestor's environment and find the
+        # command files at their predictable paths.
+        scrubbed_in() {
+          local dir="$1"
+          shift
+          local -a unset_args=()
+          local name
+          for name in CARGO_REGISTRY_TOKEN TWINE_PASSWORD \
+            UV_PUBLISH_TOKEN UV_PUBLISH_PASSWORD PDM_PUBLISH_PASSWORD \
+            FLIT_PASSWORD HATCH_INDEX_AUTH \
+            ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN \
+            GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+            GITHUB_STEP_SUMMARY; do
+            unset_args+=(-u "${name}")
+          done
+          while IFS= read -r name; do
+            case "${name}" in
+              CARGO_REGISTRIES_?*_TOKEN|POETRY_PYPI_TOKEN_?*)
+                unset_args+=(-u "${name}") ;;
+            esac
+          done < <(compgen -e)
+          (cd -- "${dir}" && \
+            exec env "${unset_args[@]}" "$@")
+        }
+        # The same, from the project directory
+        scrubbed() {
+          scrubbed_in "${PROJECT_DIR}" "$@"
+        }
+
         case "${BACKEND}" in
           syft)
             set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
@@ -2245,41 +2592,14 @@ runs:
                 # which cargo metadata and cargo-cyclonedx both execute
                 # (measured), and rust-toolchain.toml can select a
                 # toolchain directory inside the checkout. The
-                # untrusted-checkout skip covers Cargo for that reason.
-                #
-                # scrubbed runs a command from the project directory,
-                # so rustup selects the toolchain the project's
-                # rust-toolchain.toml names, without:
-                # - registry tokens: CARGO_REGISTRY_TOKEN and every
-                #   CARGO_REGISTRIES_<NAME>_TOKEN; other
-                #   CARGO_REGISTRIES_<NAME>_* settings, such as _INDEX,
-                #   stay, since resolution may need them;
-                # - the GitHub OIDC and runtime tokens;
-                # - the runner's command files, so that code from the
-                #   checkout cannot forge this step's outputs or summary,
-                #   or set the environment, PATH or state of later steps.
-                # Defence in depth, not a boundary: code running as the
-                # same user can still read an ancestor's environment and
-                # find the command files at their predictable paths.
-                scrubbed() {
-                  local -a unset_args=()
-                  local name
-                  for name in CARGO_REGISTRY_TOKEN \
-                    ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-                    ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN \
-                    GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
-                    GITHUB_STEP_SUMMARY; do
-                    unset_args+=(-u "${name}")
-                  done
-                  while IFS= read -r name; do
-                    case "${name}" in
-                      CARGO_REGISTRIES_?*_TOKEN)
-                        unset_args+=(-u "${name}") ;;
-                    esac
-                  done < <(compgen -e)
-                  (cd -- "${PROJECT_DIR}" && \
-                    exec env "${unset_args[@]}" "$@")
-                }
+                # untrusted-checkout skip covers Cargo for that reason,
+                # and every cargo call goes through scrubbed_in (above)
+                # from CARGO_DIR: path_prefix, or cargo_working_directory
+                # where one is given. Cargo reads .cargo/config.toml, and
+                # rustup rust-toolchain.toml, from there upward, so the
+                # SBOM follows the configuration a build run from that
+                # directory sees, while path_prefix still decides the
+                # manifest described.
 
                 # Sets backend_failure and returns non-zero on any
                 # failure; 'set -e' does not apply inside a function
@@ -2289,6 +2609,7 @@ runs:
                   local metadata project_manifest whole gen_name
                   local member produced count serial hex
                   local -a members=() docs=() feature_args=()
+                  local -a manifest_args=()
 
                   # The binaries themselves, not 'cargo cyclonedx':
                   # cargo resolves a subcommand through aliases in the
@@ -2324,9 +2645,20 @@ runs:
                     fi
                   fi
 
-                  echo "Rust toolchain: $(scrubbed cargo --version || true)"
-                  if ! ws_manifest="$(scrubbed cargo locate-project \
-                    --workspace --message-format plain)"; then
+                  # From cargo_working_directory, cargo would look for a
+                  # manifest from there upward, so each call that does
+                  # not name one already names path_prefix's. Unset,
+                  # Cargo runs from path_prefix and no call changes.
+                  if [ -n "${CARGO_WORKING_DIRECTORY}" ]; then
+                    manifest_args=(--manifest-path "${PROJECT_DIR}/Cargo.toml")
+                    printf 'Cargo working directory: %s\n' \
+                      "$(printf '%s' "${CARGO_DIR}" | tr -d '\r\n')"
+                  fi
+                  echo "Rust toolchain: $(scrubbed_in "${CARGO_DIR}" \
+                    cargo --version || true)"
+                  if ! ws_manifest="$(scrubbed_in "${CARGO_DIR}" \
+                    cargo locate-project --workspace --message-format plain \
+                    "${manifest_args[@]}")"; then
                     backend_failure="cargo could not locate the workspace"
                     return 1
                   fi
@@ -2345,7 +2677,8 @@ runs:
                       "dependencies as they resolve now; commit Cargo.lock" \
                       "to describe a pinned graph"
                     cargo_litter+=("${lockfile}")
-                    if ! scrubbed cargo generate-lockfile; then
+                    if ! scrubbed_in "${CARGO_DIR}" cargo generate-lockfile \
+                      "${manifest_args[@]}"; then
                       backend_failure="cargo could not resolve a lockfile"
                       return 1
                     fi
@@ -2371,7 +2704,8 @@ runs:
                     feature_args+=(--no-default-features)
                   fi
                   metadata="${cargo_scratch}/metadata.json"
-                  if ! scrubbed cargo metadata --locked --format-version 1 \
+                  if ! scrubbed_in "${CARGO_DIR}" cargo metadata --locked \
+                    --format-version 1 "${manifest_args[@]}" \
                     "${feature_args[@]}" > "${metadata}"; then
                     backend_failure="cargo metadata --locked failed; is"
                     backend_failure+=" Cargo.lock up to date"
@@ -2442,7 +2776,7 @@ runs:
                     "${CARGO_CYCLONEDX_VERSION} (build-dependencies:" \
                     "${INCLUDE_DEV}, target: ${CARGO_TARGET}," \
                     "features: ${cargo_selection})"
-                  if ! scrubbed env -u CARGO_BUILD_TARGET \
+                  if ! scrubbed_in "${CARGO_DIR}" env -u CARGO_BUILD_TARGET \
                     "${cdx_bin}" cyclonedx "$@"; then
                     backend_failure="cargo-cyclonedx failed"
                     return 1
@@ -2580,6 +2914,399 @@ runs:
                 ;;
             esac
             ;;
+          python)
+            # cyclonedx-py describes an INSTALLED environment, read from
+            # the distribution metadata in site-packages rather than a
+            # lock file, so the backend builds that environment first
+            # with the project's own package manager. Three virtual
+            # environments keep the parts apart, all under scratch:
+            # - tools: the package manager (latest release, which can
+            #   read the newest lock format) and an up-to-date pip;
+            # - cyclonedx: cyclonedx-bom at the pinned version;
+            # - env: the project's dependencies and nothing else,
+            #   created without pip. Neither tool lands in it, so
+            #   neither appears in the SBOM, and the checkout gains no
+            #   .venv.
+            #
+            # Sets backend_failure and returns non-zero on any failure;
+            # 'set -e' does not apply inside a function called as a
+            # condition, so every step checks itself.
+            python_generate() {
+              local tools cdx env_dir env_python manager_bin
+              local project="false" anchor="none" compatible="true"
+              local reason="" static="false" dev_group="false"
+              local key value lock_file="" site_packages candidate
+              local -a check_cmd=() install_cmd=() anchor_args=()
+              local -a dependencies=() pip_cmd=()
+
+              if [ -z "${PYTHON_CMD}" ] || [ ! -x "${PYTHON_CMD}" ]; then
+                backend_failure="setup-python provided no interpreter"
+                return 1
+              fi
+              echo "Python: $("${PYTHON_CMD}" --version 2>&1)"
+              tools="${python_scratch}/tools"
+              cdx="${python_scratch}/cyclonedx"
+              env_dir="${python_scratch}/env"
+              env_python="${env_dir}/bin/python"
+
+              # Every interpreter this action starts for itself runs
+              # isolated (-I): this step's working directory is the
+              # workspace, so a checkout carrying venv.py or pip.py
+              # would otherwise replace the module '-m' names, ahead of
+              # the scrub. -I also ignores PYTHON* variables and the
+              # user site directory.
+              #
+              # tomli backs the pyproject reader on Python 3.10, which
+              # lacks tomllib
+              if ! "${PYTHON_CMD}" -I -m venv "${cdx}" || \
+                ! "${cdx}/bin/python" -I -m pip install --quiet \
+                --disable-pip-version-check \
+                "cyclonedx-bom==${CYCLONEDX_PY_VERSION}" \
+                'tomli; python_version < "3.11"'; then
+                backend_failure="could not install cyclonedx-bom"
+                backend_failure+=" ${CYCLONEDX_PY_VERSION}"
+                return 1
+              fi
+              # pip itself always: the pip branches need --python
+              # (22.3) and --group (25.1)
+              set -- pip
+              case "${DEPENDENCY_MANAGER}" in
+                uv|pdm|poetry|pipenv) set -- "$@" "${DEPENDENCY_MANAGER}" ;;
+              esac
+              if ! "${PYTHON_CMD}" -I -m venv "${tools}" || \
+                ! "${tools}/bin/python" -I -m pip install --quiet \
+                --disable-pip-version-check --upgrade "$@"; then
+                backend_failure="could not install ${DEPENDENCY_MANAGER}"
+                return 1
+              fi
+              if ! "${PYTHON_CMD}" -I -m venv --without-pip "${env_dir}"; then
+                backend_failure="could not create the environment"
+                return 1
+              fi
+              # The managers are Python console scripts, which honour
+              # PYTHONPATH, so even the version report runs scrubbed,
+              # without it, and away from the checkout
+              case "${DEPENDENCY_MANAGER}" in
+                uv|pdm|poetry|pipenv)
+                  manager_bin="${tools}/bin/${DEPENDENCY_MANAGER}"
+                  echo "Package manager: $(scrubbed env -u PYTHONPATH \
+                    -u PYTHONHOME -C "${python_scratch}" \
+                    "${manager_bin}" --version)" ;;
+                *)
+                  manager_bin=""
+                  echo "Package manager: $("${tools}/bin/python" -I -m pip \
+                    --version)" ;;
+              esac
+
+              # Reads pyproject.toml with the reader the action ships,
+              # in a subcommand: 'inspect' before the install, 'anchor'
+              # after it. Parsing alone: the reader runs no code from
+              # the checkout. Its output is captured whole before being
+              # parsed, so a reader that fails returns non-zero here
+              # instead of leaving the defaults standing.
+              # The action's scripts run as a package, from the action's
+              # own directory: 'python -E -s -m scripts.python_backend'.
+              # '-m' puts the working directory first on the path, which
+              # is why that directory is the action's and never the
+              # checkout's; -E and -s leave PYTHON* variables and the
+              # user site out.
+              backend_helper() {
+                (cd -- "${GITHUB_ACTION_PATH}" && \
+                  exec "${cdx}/bin/python" -E -s -m scripts.python_backend \
+                  "$@")
+              }
+              read_pyproject() {
+                local output
+                if ! output="$(backend_helper \
+                  "$1" "${PROJECT_DIR}/pyproject.toml" "${@:2}")"; then
+                  backend_failure="could not read pyproject.toml ($1)"
+                  return 1
+                fi
+                while IFS='=' read -r key value; do
+                  case "${key}" in
+                    project) project="${value}" ;;
+                    anchor) anchor="${value}" ;;
+                    compatible) compatible="${value}" ;;
+                    reason) reason="${value}" ;;
+                    static_dependencies) static="${value}" ;;
+                    dev_group) dev_group="${value}" ;;
+                  esac
+                done <<< "${output}"
+              }
+              if [ -f "${PROJECT_DIR}/pyproject.toml" ]; then
+                read_pyproject inspect "${python_scratch}/dependencies" \
+                  || return 1
+              else
+                reason="the project has no pyproject.toml"
+              fi
+
+              # Every manager is pointed at env: uv through
+              # UV_PROJECT_ENVIRONMENT, PDM through PDM_PYTHON (ignoring
+              # any interpreter the checkout saved), Poetry and Pipenv
+              # through the active virtual environment. Variables that
+              # would point them elsewhere are removed, PYTHONPATH and
+              # PYTHONHOME among them: the managers' interpreters and
+              # the scanned one would otherwise import, and report, what
+              # an inherited path names.
+              #
+              # uv is bound to python_version's interpreter, with Python
+              # downloads off. Left alone it resolves its own from
+              # requires-python and .python-version and downloads the
+              # newest that fits, a release new enough to lack wheels, so
+              # the install compiles from source until the job times out
+              # (python-sbom-action#151). Bound, a project python_version
+              # cannot serve fails at the lock check, in seconds.
+              in_env() {
+                scrubbed env -u PYTHONPATH -u PYTHONHOME \
+                  -u PIPENV_IGNORE_VIRTUALENVS \
+                  -u PDM_IGNORE_ACTIVE_VENV -u UV_FROZEN -u UV_NO_SYNC \
+                  "VIRTUAL_ENV=${env_dir}" "PATH=${env_dir}/bin:${PATH}" \
+                  "UV_PROJECT_ENVIRONMENT=${env_dir}" \
+                  "UV_PYTHON=${PYTHON_CMD}" UV_PYTHON_DOWNLOADS=never \
+                  "PDM_PYTHON=${env_python}" PDM_IGNORE_SAVED_PYTHON=1 \
+                  PDM_CHECK_UPDATE=false POETRY_VIRTUALENVS_CREATE=false \
+                  PIPENV_VERBOSITY=-1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+                  PIP_NO_INPUT=1 "$@"
+              }
+
+              # The environment comes from the lock file, so a lock that
+              # predates its manifest installs the previous dependency
+              # set and the SBOM omits whatever the change under review
+              # added. PDM's sync exits 0 in that state, so an explicit
+              # check is the only reliable signal across managers.
+              case "${DEPENDENCY_MANAGER}" in
+                uv)
+                  lock_file="uv.lock"
+                  check_cmd=("${manager_bin}" lock --check) ;;
+                pdm)
+                  lock_file="pdm.lock"
+                  check_cmd=("${manager_bin}" lock --check) ;;
+                poetry)
+                  lock_file="poetry.lock"
+                  check_cmd=("${manager_bin}" check --lock) ;;
+                pipenv)
+                  lock_file="Pipfile.lock"
+                  check_cmd=("${manager_bin}" verify) ;;
+              esac
+              if [ "${#check_cmd[@]}" -gt 0 ]; then
+                echo "Checking ${lock_file} against its manifest"
+                # Kept as well as shown: for uv a failure here can mean the
+                # interpreter rather than the lock, which needs another fix
+                if ! in_env "${check_cmd[@]}" 2>&1 | \
+                  tee "${python_scratch}/lock-check.log"; then
+                  if [ "${DEPENDENCY_MANAGER}" = "uv" ] && grep -q \
+                    "incompatible with the project's Python requirement" \
+                    "${python_scratch}/lock-check.log"; then
+                    backend_failure="python_version '${PYTHON_VERSION}' does"
+                    backend_failure+=" not satisfy the project's"
+                    backend_failure+=" requires-python; uv is bound to it and"
+                    backend_failure+=" downloads no other, so set"
+                    backend_failure+=" python_version to one the project"
+                    backend_failure+=" supports"
+                  else
+                    backend_failure="${lock_file} does not match its"
+                    backend_failure+=" manifest; run '${DEPENDENCY_MANAGER}"
+                    backend_failure+=" lock' and commit the result"
+                  fi
+                  return 1
+                fi
+              fi
+
+              # include_dev maps onto each manager's own notion of a
+              # development dependency. Optional extras are installed by
+              # none of them.
+              pip_cmd=("${tools}/bin/python" -I -m pip --python
+                "${env_python}" install)
+              case "${DEPENDENCY_MANAGER}" in
+                uv)
+                  # The project itself stays out: it is the root, and
+                  # building it would run its build backend for nothing
+                  install_cmd=("${manager_bin}" sync --locked
+                    --no-install-project)
+                  # Every group [tool.uv] default-groups names, not 'dev'
+                  # alone, which is all --no-dev drops
+                  if [ "${INCLUDE_DEV}" != "true" ]; then
+                    install_cmd+=(--no-default-groups)
+                  fi ;;
+                pdm)
+                  install_cmd=("${manager_bin}" sync --no-self)
+                  if [ "${INCLUDE_DEV}" != "true" ]; then
+                    install_cmd+=(--prod)
+                  fi ;;
+                poetry)
+                  install_cmd=("${manager_bin}" install --no-root
+                    --no-interaction)
+                  if [ "${INCLUDE_DEV}" != "true" ]; then
+                    install_cmd+=(--only=main)
+                  fi ;;
+                pipenv)
+                  # --deploy refuses a stale Pipfile.lock. There is
+                  # deliberately no --skip-lock: it ignores the lock.
+                  install_cmd=("${manager_bin}" install --deploy)
+                  if [ "${INCLUDE_DEV}" = "true" ]; then
+                    install_cmd+=(--dev)
+                  fi ;;
+                pip-tools|pip)
+                  # Development sources first, whichever file supplies
+                  # the runtime set below; static dependencies follow
+                  # '--', after which pip reads no further options
+                  install_cmd=("${pip_cmd[@]}")
+                  if [ "${INCLUDE_DEV}" = "true" ]; then
+                    if [ "${dev_group}" = "true" ]; then
+                      install_cmd+=(--group dev)
+                    fi
+                    if [ -f "${PROJECT_DIR}/requirements-dev.txt" ]; then
+                      install_cmd+=(-r requirements-dev.txt)
+                    fi
+                  fi
+                  if [ -f "${PROJECT_DIR}/requirements.txt" ]; then
+                    install_cmd+=(-r requirements.txt)
+                  elif [ "${static}" = "true" ]; then
+                    # Declared dependencies install directly, without
+                    # building the project or writing into the checkout
+                    mapfile -d '' -t dependencies \
+                      < "${python_scratch}/dependencies"
+                    if [ "${#dependencies[@]}" -gt 0 ]; then
+                      install_cmd+=(-- "${dependencies[@]}")
+                    fi
+                  else
+                    # Dependencies the build backend computes exist only
+                    # once it runs, so the project is built and
+                    # installed; cyclonedx-py leaves the root's own
+                    # distribution out of the components
+                    install_cmd+=(.)
+                  fi
+                  if [ "${#install_cmd[@]}" -eq "${#pip_cmd[@]}" ]; then
+                    install_cmd=()
+                  fi
+                  if [ "${DEPENDENCY_MANAGER}" = "pip" ]; then
+                    echo "::warning::No lock file: the SBOM describes" \
+                      "dependencies as they resolve now; commit a lock" \
+                      "file or compiled requirements to describe a" \
+                      "pinned set"
+                  fi ;;
+              esac
+              if [ "${#install_cmd[@]}" -gt 0 ]; then
+                echo "Installing dependencies with ${DEPENDENCY_MANAGER}" \
+                  "(development dependencies: ${INCLUDE_DEV})"
+                if ! in_env "${install_cmd[@]}"; then
+                  backend_failure="dependency installation with"
+                  backend_failure+=" ${DEPENDENCY_MANAGER} failed; the SBOM"
+                  backend_failure+=" would omit whatever did not install"
+                  return 1
+                fi
+              else
+                echo "The project declares no dependencies to install"
+              fi
+
+              # The environment's interpreter decides which markers hold,
+              # so it reports its own marker environment rather than this
+              # action assuming one. -S keeps the site module, and with
+              # it every installed .pth file, from running; -I keeps the
+              # checkout and PYTHON* variables off its path. site-packages
+              # is found by glob, which needs no interpreter at all.
+              if ! scrubbed env -u PYTHONPATH -u PYTHONHOME \
+                -C "${python_scratch}" "${env_python}" -I -S \
+                "${GITHUB_ACTION_PATH}/scripts/marker_environment.py" \
+                > "${python_scratch}/markers.json"; then
+                backend_failure="the environment's interpreter could"
+                backend_failure+=" not report its marker environment"
+                return 1
+              fi
+              site_packages=""
+              for candidate in "${env_dir}"/lib/python*/site-packages; do
+                if [ -d "${candidate}" ]; then
+                  site_packages="${candidate}"
+                fi
+                break
+              done
+              if [ -z "${site_packages}" ]; then
+                backend_failure="the environment has no site-packages"
+                return 1
+              fi
+
+              # The root component, read against the environment now that
+              # it exists: its Python must meet requires-python (a pip
+              # install of the dependencies alone never checks), and a
+              # dynamic project's dependencies exist only in its
+              # installed metadata.
+              if [ "${project}" = "true" ]; then
+                reason=""
+                read_pyproject anchor "${python_scratch}/anchor.toml" \
+                  "${site_packages}" "${python_scratch}/markers.json" \
+                  || return 1
+                if [ "${compatible}" != "true" ]; then
+                  backend_failure="the environment's Python is outside the"
+                  backend_failure+=" project's requires-python; set"
+                  backend_failure+=" python_version to one it supports"
+                  return 1
+                fi
+              fi
+              if [ "${anchor}" = "project" ]; then
+                anchor_args=(--pyproject "${python_scratch}/anchor.toml")
+                if [ -n "${reason}" ]; then
+                  echo "::warning::The SBOM's root component has no" \
+                    "dependencies: ${reason}"
+                fi
+              else
+                echo "::warning::The SBOM has no root component:" \
+                  "${reason:-the environment could not be read}, so" \
+                  "direct dependencies cannot be told from transitive ones"
+              fi
+
+              # One scan, to JSON. The interpreter is the scanned
+              # environment's, which executes its .pth files, so the scan
+              # runs scrubbed as well, and from scratch rather than the
+              # checkout, which the interpreter would otherwise put on
+              # its module path.
+              echo "Generating SBOM with cyclonedx-py" \
+                "${CYCLONEDX_PY_VERSION}"
+              if ! scrubbed env -u PYTHONPATH -u PYTHONHOME \
+                -C "${python_scratch}" \
+                "${cdx}/bin/cyclonedx-py" environment \
+                "${anchor_args[@]}" --sv "${SPEC_VERSION}" \
+                --of JSON -o "${python_scratch}/scanned.json" \
+                "${env_python}"; then
+                backend_failure="cyclonedx-py failed"
+                return 1
+              fi
+
+              # cyclonedx-py turns every Requires-Dist of every
+              # distribution into an edge, by name, whatever its marker
+              # says: pluggy's 'pytest; extra == "testing"' links pluggy
+              # to pytest wherever pytest is installed (measured,
+              # 7.5.0). The reader gives every component, the project
+              # included, the edges whose marker holds for this
+              # interpreter with the extras actually requested, checks
+              # the result against the schema, and writes both formats
+              # from that one document; cyclonedx-python-lib writes the
+              # same XML cyclonedx-py does (measured, 1.5 and 1.6). The
+              # project's requirements come from its own pyproject.toml,
+              # optional dependencies included, where it is not
+              # installed.
+              set -- "${python_scratch}/scanned.json" "${site_packages}" \
+                "${python_scratch}/markers.json" "${SPEC_VERSION}"
+              if [ "${anchor}" = "project" ]; then
+                set -- "$@" "${PROJECT_DIR}/pyproject.toml"
+              else
+                set -- "$@" -
+              fi
+              set -- "$@" "${json_path}"
+              if [ "${SBOM_FORMAT}" != "json" ]; then
+                set -- "$@" "${xml_path}"
+              fi
+              if ! backend_helper finish "$@"; then
+                backend_failure="could not finish the document"
+                return 1
+              fi
+            }
+
+            python_scratch="$(mktemp -d "${RUNNER_TEMP}/sbom-python.XXXXXX")"
+            backend_exit=0
+            if ! python_generate; then
+              backend_exit=1
+            fi
+            ;;
         esac
 
         # Decide the verdict from the artefacts, not the exit code
@@ -2654,7 +3381,9 @@ runs:
           echo "## 📋 SBOM Generation Results"
           echo ""
           echo "**Backend:** ${BACKEND}"
-          if [ -n "${DEPENDENCY_MANAGER}" ]; then
+          if [ -n "${DEPENDENCY_MANAGER}" ] && [ "${BACKEND}" = "python" ]; then
+            echo "**Package Manager:** ${DEPENDENCY_MANAGER}"
+          elif [ -n "${DEPENDENCY_MANAGER}" ]; then
             echo "**Build Tool:** ${DEPENDENCY_MANAGER}"
           fi
           if [ -n "${cargo_selection:-}" ]; then

@@ -26,19 +26,22 @@ in this organisation use to audit the generated SBOM in a separate,
 downstream job.
 
 A second backend runs the CycloneDX project's own build-tool plugins
-for Java projects, where static analysis falls short. See
+for Java and Rust projects, where static analysis falls short, and a
+third generates Python SBOMs from an installed environment. See
 [Backends](#backends) for how to choose between them.
 
 The `mode` input chooses what the document describes: a project
 directory (the default), or one SBOM per container image from docker
 archives. See [Container images](#container-images).
 
-The interface mirrors
+The interface began as a mirror of
 [python-sbom-action](https://github.com/lfreleng-actions/python-sbom-action),
-giving callers one contract across the actions estate. Future backends
-(such as `cyclonedx-npm` or `cyclonedx-gomod`) can slot in behind the
-same interface through the `backend` input, without changes to calling
-workflows.
+which the `python` backend now replaces, giving callers one contract
+across the actions estate. See
+[Migrating from python-sbom-action](#migrating-from-python-sbom-action).
+Future backends (such as `cyclonedx-npm` or `cyclonedx-gomod`) can slot
+in behind the same interface through the `backend` input, without
+changes to calling workflows.
 
 ## Backends
 
@@ -47,10 +50,11 @@ system it drives.
 
 <!-- markdownlint-disable MD013 -->
 
-| Backend          | Tool                         | Build tools driven   | Needs a toolchain                   | Use for                                 |
-| ---------------- | ---------------------------- | -------------------- | ----------------------------------- | --------------------------------------- |
-| `syft` (default) | syft static analysis         | none                 | No                                  | Go, Node.js, Rust, containers, binaries |
-| `cyclonedx`      | CycloneDX build-tool plugins | Maven, Gradle, Cargo | JDK + build tool, or Rust toolchain | Java and Rust projects                  |
+| Backend          | Tool                         | Build tools driven                      | Needs a toolchain                   | Use for                                 |
+| ---------------- | ---------------------------- | --------------------------------------- | ----------------------------------- | --------------------------------------- |
+| `syft` (default) | syft static analysis         | none                                    | No                                  | Go, Node.js, Rust, containers, binaries |
+| `cyclonedx`      | CycloneDX build-tool plugins | Maven, Gradle, Cargo                    | JDK + build tool, or Rust toolchain | Java and Rust projects                  |
+| `python`         | `cyclonedx-py` (CycloneDX)   | uv, PDM, Poetry, Pipenv, pip-tools, pip | Python (installed by the action)    | Python projects                         |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -63,11 +67,13 @@ declares it.
 
 Because the backend name does not identify the build system, the
 `dependency_manager` output reports which one ran (`maven`, `gradle` or
-`cargo`).
+`cargo`, or for `python` the package manager: `uv`, `pdm`, `poetry`,
+`pipenv`, `pip-tools` or `pip`).
 It stays empty for `syft`, which drives no build tool.
 
-The `cyclonedx` backend fails fast when it cannot find a build system
-it supports, rather than attempting an invocation that cannot work.
+The `cyclonedx` and `python` backends fail fast when they cannot find a
+project they support, rather than attempting an invocation that cannot
+work.
 
 ### Why Java needs a different backend
 
@@ -129,6 +135,46 @@ target platform and emits the `dependencies` graph a scanner needs to
 tell a crate the project declares from one it inherits. See
 [Cargo specifics](#cargo-specifics).
 
+### Why Python has its own backend
+
+Python is the one backend named after an ecosystem rather than a tool,
+because its tool works differently. `cyclonedx-py` reads the
+distribution metadata of an **installed** environment rather than a
+lock file, so the action has to build that environment first, with the
+package manager the project uses, and the backend owns that sequence:
+check the lock, install, then scan. An environment is the most
+faithful description Python offers: it holds what the resolver chose
+for this interpreter and platform, with environment markers already
+applied, and each distribution's own record of what it requires, which
+is where the `dependencies` graph comes from.
+
+A separate backend also keeps Python's detection apart. A Python
+project often carries a `Cargo.toml` for a native extension (PyO3,
+maturin) that the `cyclonedx` backend's detection would claim.
+
+The backend absorbs
+[python-sbom-action](https://github.com/lfreleng-actions/python-sbom-action),
+keeping its detection order and `dependency_manager` values, and fixes
+four defects along the way:
+
+- **Tooling in the SBOM.** python-sbom-action installed `cyclonedx-bom`
+  into the environment it scanned, so its own dependency tree appeared
+  in every document as though the project used it. The project's
+  dependencies now install into an environment of their own, which
+  holds nothing else — not even `pip`.
+- **No root component.** A root appeared solely for a project with no
+  lock file at all; every lock-file project produced edges with nothing
+  to anchor them, so nothing could tell a direct dependency from an
+  inherited one. Any project with a PEP 621 `[project]` table now gets
+  one. See [Python specifics](#python-specifics).
+- **Scanning the runner.** A project carrying a `pyproject.toml` and no
+  lock or requirements file installed nothing, and the scan described
+  the runner's own Python instead. Its declared dependencies now install
+  like any other.
+- **An unpinned installer script.** uv came from
+  `curl https://astral.sh/uv/install.sh | sh`; every package manager
+  now comes from PyPI into a separate environment.
+
 ### Trust Boundary
 
 > ⚠️ **The `cyclonedx` backend requires a trusted checkout.** Running a
@@ -159,17 +205,29 @@ names programs to run:
   directory inside the checkout, and the action runs cargo from the
   project directory so that file applies.
 
+The `python` backend installs the project's dependencies, and Python
+installation runs code:
+
+- a dependency published without a wheel builds from source, running
+  its build backend — `setup.py` among them — and a requirements file
+  can name a local directory, which builds from the checkout;
+- a project whose dependencies are dynamic needs its build backend to
+  compute them, so the action builds it;
+- the environment's interpreter runs the `.pth` files installed
+  packages carry whenever it starts, which it does for the scan.
+
 No command-line flag turns any of that off, and for Maven it happens
 even though the goal never compiles source or runs tests. A project
-supplying a core extension, a build script, a wrapper or a cargo
-configuration thus executes code in the job.
+supplying a core extension, a build script, a wrapper, a cargo
+configuration or a package built from source thus executes code in the
+job.
 
 This is a real difference from the `syft` backend, which reads files
 and executes nothing from the project.
 
-The practical consequence: **do not point the `cyclonedx` backend at
-untrusted content**. The action defends this by default — see
-[Untrusted checkouts](#untrusted-checkouts).
+The practical consequence: **do not point the `cyclonedx` or `python`
+backend at untrusted content**. The action defends this by default —
+see [Untrusted checkouts](#untrusted-checkouts).
 
 ### Untrusted checkouts
 
@@ -186,11 +244,11 @@ to run the backend at all. The `untrusted_checkout` input decides:
 
 <!-- markdownlint-enable MD013 -->
 
-When the checkout resolves to untrusted, the `cyclonedx` backend is
-**skipped**. The step succeeds, `skipped` reports `true`, and the
-action writes no document — clearing both destination paths first, so
-a committed or leftover document cannot survive the skip for a
-caller's artifact glob to collect. This does not affect the `syft`
+When the checkout resolves to untrusted, the `cyclonedx` and `python`
+backends are **skipped**. The step succeeds, `skipped` reports `true`,
+and the action writes no document — clearing both destination paths
+first, so a committed or leftover document cannot survive the skip for
+a caller's artifact glob to collect. This does not affect the `syft`
 backend, which executes nothing from the project.
 
 > One qualification: a guard protects the clearing. Where a
@@ -233,10 +291,10 @@ against.
 The test is **cross-repository, not unmerged**. Someone with write
 access pushed that same-repository branch, and the same access lets
 them push to the default branch; classifying their pull request as
-untrusted would disable this backend for pull request scanning without
-raising a bar they do not already clear. Callers whose threat model
-includes write-access contributors should set `untrusted_checkout:
-'true'` and scan on the default branch instead.
+untrusted would disable these backends for pull request scanning
+without raising a bar they do not already clear. Callers whose threat
+model includes write-access contributors should set
+`untrusted_checkout: 'true'` and scan on the default branch instead.
 
 It will **not** catch, among others:
 
@@ -253,6 +311,15 @@ exposes an `is_fork` output to wire straight in.
 > Note that `is_fork` there derives from `head.repo.fork` — whether the
 > head repository is itself a fork — a slightly broader test than the
 > cross-repository comparison `auto` performs.
+
+The skip protects the SBOM job's own context: its token, permissions,
+secrets and runner. An earlier job that ran the same checkout's code
+does not, by itself, make that safe, since each job has its own. A
+reusable workflow can pass `untrusted_checkout: 'false'` so fork pull
+requests keep their SBOM when the SBOM job holds **nothing** the
+earlier job did not: no wider `permissions`, no secrets that job
+lacked, and the same class of runner. The Java workflows pass it on
+that basis. Where the SBOM job holds more, keep `auto`.
 
 ## Usage Example
 
@@ -294,6 +361,18 @@ steps:
       path_prefix: '.'
       cargo_features: 'serde, my-crate/tls'
       cargo_no_default_features: 'true'
+```
+
+For a Python project:
+
+```yaml
+steps:
+  - name: "Generate SBOM"
+    id: sbom
+    uses: lfreleng-actions/sbom-action@main
+    with:
+      backend: 'python'
+      path_prefix: '.'
 ```
 
 <!-- markdownlint-enable MD046 -->
@@ -367,9 +446,10 @@ exists.
 For Cargo the backend installs no JDK. It needs a **Rust toolchain on
 the runner** (`cargo` on `PATH`); GitHub-hosted images ship `rustup`,
 and the run fails before installing anything where `cargo` is absent.
-The action pins no toolchain: cargo runs from the project directory,
-where the project's `rust-toolchain.toml` applies and `rustup` may
-install the toolchain it names. A caller wanting a particular toolchain
+The action pins no toolchain: cargo runs from the project directory, or
+from `cargo_working_directory` where set, and the `rust-toolchain.toml`
+found from there applies, so `rustup` may install the toolchain it
+names. A caller wanting a particular toolchain
 sets it up before this action.
 
 `taiki-e/install-action` fetches `cargo-cyclonedx`, and for XML
@@ -383,13 +463,41 @@ GitHub release assets, to the crates.io index and download hosts
 resolves against, and to the `rustup` distribution host where the
 project's toolchain is not installed yet.
 
+The `python` backend installs Python with `actions/setup-python`
+(`python_version`, default `3.12`), leaving the job's own Python and
+`PATH` as they were. It then installs the package manager — the latest
+release, which reads the newest lock formats — and `cyclonedx-bom` from
+PyPI, so runners need egress to `pypi.org` and
+`files.pythonhosted.org`, or the index `PIP_INDEX_URL` names. The
+project's dependencies resolve against the indexes the project or
+caller configures. The action never downloads a Python of its own; see
+below. The organisation's shared harden-runner allow-list carries each
+of these.
+
+`python_version` decides the interpreter for every package manager, uv
+included, so it has to meet the project's `requires-python`. uv runs
+bound to that interpreter (`UV_PYTHON`) with Python downloads disabled,
+and neither `requires-python` nor a `.python-version` can make it fetch
+another. Left unbound, uv picks the newest Python a project allows and
+downloads it, a release new enough to lack wheels, so the install
+compiles dependencies from source until the job times out
+([python-sbom-action#151](https://github.com/lfreleng-actions/python-sbom-action/issues/151)).
+A `python_version` the project rejects fails the run at the lock check,
+within seconds, with an error naming the input. It must be **3.10 or
+later**: every older
+release is end of life, and the current releases of pip, uv, PDM,
+Poetry and Pipenv all require 3.10. Validation refuses anything older.
+The action's own tests run on every release from 3.10 to 3.15. On 3.10,
+which lacks `tomllib`, the action installs `tomli` for its own
+`pyproject.toml` reader.
+
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
 | Name                    | Required | Default          | Description                                                                              |
 | ----------------------- | -------- | ---------------- | ---------------------------------------------------------------------------------------- |
-| backend                 | False    | `syft`           | SBOM generation backend: `syft` or `cyclonedx`                                           |
+| backend                 | False    | `syft`           | SBOM generation backend: `syft`, `cyclonedx` or `python`                                 |
 | mode                    | False    | `directory`      | What to describe: `directory` (`path_prefix`) or `image`                                 |
 | path_prefix             | False    | `.`              | Project directory; must resolve within the workspace                                     |
 | image_archive_directory | False    | `''`             | Image mode: directory of docker archives, one image per `*.tar` file                     |
@@ -403,32 +511,42 @@ project's toolchain is not installed yet.
 
 <!-- markdownlint-enable MD013 -->
 
-### CycloneDX backend inputs
+### CycloneDX and Python backend inputs
 
-These apply when `backend` is `cyclonedx`, but the action validates
-them on every run so a typo surfaces regardless of the backend in use.
+These apply when `backend` is `cyclonedx` or `python` (the first two
+to both), but the action validates them on every run so a typo
+surfaces regardless of the backend in use.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                      | Required | Default   | Description                                                                               |
-| ------------------------- | -------- | --------- | ----------------------------------------------------------------------------------------- |
-| dependency_manager        | False    | `auto`    | Build tool: `auto`, `maven`, `gradle` or `cargo`                                          |
-| java_version              | False    | `21`      | JDK version for the cyclonedx backend                                                     |
-| java_distribution         | False    | `temurin` | JDK distribution for the cyclonedx backend                                                |
-| maven_plugin_version      | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer                                        |
-| maven_args                | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace                           |
-| gradle_plugin_version     | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer                                       |
-| gradle_version            | False    | `''`      | Gradle version the project uses; empty asks the build tool                                |
-| gradle_args               | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace                          |
-| cargo_cyclonedx_version   | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                                               |
-| cyclonedx_cli_version     | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo                                |
-| cargo_target              | False    | `all`     | Cargo: `all` targets, or one target triple to describe                                    |
-| cargo_features            | False    | `''`      | Cargo: features to activate, separated by whitespace or commas; `package/feature` allowed |
-| cargo_all_features        | False    | `false`   | Cargo: activate all features (`--all-features`)                                           |
-| cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                         |
-| untrusted_checkout        | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`                                      |
+| Name                      | Required | Default   | Description                                                                                                      |
+| ------------------------- | -------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
+| dependency_manager        | False    | `auto`    | `auto`; `maven`, `gradle` or `cargo` (cyclonedx); `uv`, `pdm`, `poetry`, `pipenv`, `pip-tools` or `pip` (python) |
+| untrusted_checkout        | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`                                                             |
+| java_version              | False    | `21`      | JDK version for the cyclonedx backend                                                                            |
+| java_distribution         | False    | `temurin` | JDK distribution for the cyclonedx backend                                                                       |
+| maven_plugin_version      | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer                                                               |
+| maven_args                | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace                                                  |
+| gradle_plugin_version     | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer                                                              |
+| gradle_version            | False    | `''`      | Gradle version the project uses; empty asks the build tool                                                       |
+| gradle_args               | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace                                                 |
+| cargo_cyclonedx_version   | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                                                                      |
+| cyclonedx_cli_version     | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo                                                       |
+| cargo_target              | False    | `all`     | Cargo: `all` targets, or one target triple to describe                                                           |
+| cargo_features            | False    | `''`      | Cargo: features to activate, separated by whitespace or commas; `package/feature` allowed                        |
+| cargo_all_features        | False    | `false`   | Cargo: activate all features (`--all-features`)                                                                  |
+| cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                                                |
+| cargo_working_directory   | False    | `''`      | Cargo: directory to run Cargo from, `path_prefix` or beneath it; empty runs it from `path_prefix`                |
+| python_version            | False    | `3.12`    | Python for the python backend's tools and environment; `3.10` or newer                                           |
+| cyclonedx_py_version      | False    | `7.5.0`   | `cyclonedx-bom` (`cyclonedx-py`) version for the python backend; `4.0.0` or newer                                |
 
 <!-- markdownlint-enable MD013 -->
+
+A declared `dependency_manager` must belong to the backend selected:
+`uv` with `backend: cyclonedx` fails, as does `maven` with
+`backend: python`. The `syft` backend ignores the input.
+`cargo_working_directory` fails any run that drives no Cargo; see
+[Cargo specifics](#cargo-specifics).
 
 #### Choosing the build tool
 
@@ -695,6 +813,43 @@ their package as components and appear nowhere in the graph.
 `metadata.tools` lists `cargo-cyclonedx` in the 1.4 form, a list, at
 spec 1.5 too.
 
+**Working directory.** Cargo reads `.cargo/config.toml`, and `rustup`
+reads `rust-toolchain.toml`, from the directory it runs in and each
+directory above it, not from the manifest. The action runs Cargo from
+`path_prefix` by default, so with `path_prefix` at a workspace root a
+configuration in a member directory does not apply. Where the build runs
+Cargo from that member, a source replacement, `[patch]` or registry
+setting there can then fail the lockfile check, or resolve a graph
+other than the one the build used (measured). `cargo_working_directory`
+runs Cargo from that directory instead, while `path_prefix` still
+decides what the document describes:
+
+```yaml
+- uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    backend: cyclonedx
+    dependency_manager: cargo
+    path_prefix: '.'
+    cargo_working_directory: 'crates/cli'
+```
+
+Every Cargo call then runs from `crates/cli`: `cargo --version`,
+`cargo locate-project`, `cargo generate-lockfile`, `cargo metadata` and
+`cargo-cyclonedx`, and each one that reads a manifest names
+`<path_prefix>/Cargo.toml` through `--manifest-path`. The value resolves
+against `GITHUB_WORKSPACE` as `path_prefix` does, symlinks followed, and
+has to name `path_prefix` itself or a directory beneath it. Validation
+refuses anything else, and the action checks again at the point of
+use, before running Cargo. Left empty, the default, Cargo runs from
+`path_prefix` and every call stays as before.
+
+The input applies to Cargo alone. Unlike the other `cargo_*` inputs, a
+non-empty value fails a run with another backend or build tool rather
+than going unused, because a caller who sets it expects the SBOM to
+follow that directory's configuration. An untrusted checkout skips
+before detecting a build tool, so there the backend and a declared
+`dependency_manager` decide alone.
+
 **Environment.** cargo and `cargo-cyclonedx` run without
 `CARGO_REGISTRY_TOKEN`, any `CARGO_REGISTRIES_<NAME>_TOKEN`, the GitHub
 OIDC request variables, `ACTIONS_RUNTIME_TOKEN`, or the paths of the
@@ -707,9 +862,170 @@ as the same user can still read an ancestor process's environment and
 find the command files at their predictable paths. The
 [Trust Boundary](#trust-boundary) still applies.
 
+#### Python specifics
+
+**Detection.** Left at `auto`, the action reads `path_prefix` in
+python-sbom-action's order, so a project resolves to the manager, and
+reports the `dependency_manager` value, that it always did:
+
+<!-- markdownlint-disable MD013 -->
+
+| Order | Present in `path_prefix`                                          | `dependency_manager` | Installs from                                     |
+| ----- | ----------------------------------------------------------------- | -------------------- | ------------------------------------------------- |
+| 1     | `uv.lock`                                                         | `uv`                 | `uv.lock`                                         |
+| 2     | `pdm.lock`                                                        | `pdm`                | `pdm.lock`                                        |
+| 3     | `poetry.lock`                                                     | `poetry`             | `poetry.lock`                                     |
+| 4     | `Pipfile.lock`                                                    | `pipenv`             | `Pipfile.lock`                                    |
+| 5     | `requirements.txt` pinning with `==`, or beside `requirements.in` | `pip-tools`          | `requirements.txt`                                |
+| 6     | `requirements.txt`                                                | `pip`                | `requirements.txt`                                |
+| 7     | `pyproject.toml`                                                  | `pip`                | Its `[project]` dependencies                      |
+
+<!-- markdownlint-enable MD013 -->
+
+A declared value must find its file in `path_prefix`. Point
+`path_prefix` at the directory holding the lock file: a uv or PDM
+workspace member keeps no lock of its own, so it resolves as `pip`.
+
+**Commands.** Each manager checks its lock against the manifest, then
+installs:
+
+<!-- markdownlint-disable MD013 -->
+
+| Manager            | Lock check            | Install                                                     | `include_dev: 'true'`                                                             |
+| ------------------ | --------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `uv`               | `uv lock --check`     | `uv sync --locked --no-install-project --no-default-groups` | Drops `--no-default-groups`: every group `default-groups` names, `dev` by default |
+| `pdm`              | `pdm lock --check`    | `pdm sync --no-self --prod`                                 | Drops `--prod`: every development group                                           |
+| `poetry`           | `poetry check --lock` | `poetry install --no-root`, main group alone                | Every non-optional group                                                          |
+| `pipenv`           | `pipenv verify`       | `pipenv install --deploy`                                   | Adds `--dev`                                                                      |
+| `pip-tools`, `pip` | none                  | `pip install -r requirements.txt`                           | Adds `-r requirements-dev.txt` and `--group dev`, each where present              |
+| `pip` (pyproject)  | none                  | `pip install` the `[project]` dependencies                  | Adds `-r requirements-dev.txt` and `--group dev`, each where present              |
+
+<!-- markdownlint-enable MD013 -->
+
+None installs optional extras. A `pyproject.toml` whose dependencies are
+`dynamic` stay unknown until its build backend runs, so for `pip` the
+action builds and installs the project itself; pip builds it in place,
+leaving `build/` and `*.egg-info` in the checkout as a build would.
+Every other path leaves the checkout untouched.
+
+**Lock files.** A lock that predates its manifest installs the previous
+dependency set, and the SBOM would omit whatever the change under
+review added — so a vulnerability scan would never see it. A stale
+lock counts as a generation failure, as does any failed install:
+under `fail_on_error: 'false'` the run warns and publishes nothing,
+with `component_count` of `0`. The check runs explicitly for every
+lock-file manager, because `pdm sync` exits 0 on a stale lock. For
+`pip` there is no lock, and the action warns that the document
+describes dependencies as they resolve today.
+
+The environment's Python must also meet the project's
+`requires-python`, or the run fails the same way: the managers check
+it themselves, but a pip install of the declared dependencies does
+not, and would skip without a word any dependency whose marker excludes
+the wrong interpreter.
+
+**The root component.** `cyclonedx-py` anchors the graph on a root
+taken from `--pyproject`, whose `dependsOn` lists the project's direct
+dependencies, so a reader can tell those from inherited ones. The
+action passes a copy of the project's PEP 621 `[project]` table alone,
+for two reasons measured on `cyclonedx-bom` 7.5.0:
+
+- given the whole file, `cyclonedx-py` reads a `[tool.poetry]` table
+  for the root's name, and fails with `KeyError: 'name'` on the
+  ordinary Poetry 2 layout, where that table holds settings alone;
+- it links the root to every installed package
+  `[project.optional-dependencies]` names, so an extra installed solely
+  because a development group also names it would read as a runtime
+  dependency. The copy leaves optional dependencies out.
+
+Dependencies that are `dynamic` come from the installed project's own
+metadata instead, which `pip` has after building it. Either way the
+action keeps each dependency whose environment marker holds for the
+scanned interpreter with no extra selected, since `cyclonedx-py` links
+the root by name alone and would otherwise take
+`six; python_version < "3"` for a runtime dependency wherever something
+else installed `six`. Where the project
+is not installed — the lock-file managers leave it out — the root has
+no edges, and the action warns. The project itself is never a
+component, since it serves as the root.
+
+Measured against the fixtures in `tests/fixtures/python`:
+
+<!-- markdownlint-disable MD013 -->
+
+| Project                                                  | `metadata.component`                    | Root `dependsOn`                                         |
+| -------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------- |
+| PEP 621 `[project]`, any manager                         | The project, `bom-ref` `root-component` | Its runtime dependencies; development ones are not edges |
+| `dynamic` dependencies, `pip`                            | The project                             | From the installed metadata                              |
+| No `[project]` table (`Pipfile`, requirements, Poetry 1) | None, with a warning                    | —                                                        |
+
+<!-- markdownlint-enable MD013 -->
+
+Every component has a `dependencies` entry, `bom-ref` values take the
+form `name==version`, and each component carries its `purl`
+(`pkg:pypi/six@1.17.0`). Development dependencies appear as components
+with no edge from the root, since the project does not depend on them
+at runtime.
+
+**Edges.** `cyclonedx-py` turns every dependency an installed
+distribution declares into an edge, whatever its marker says, so
+pluggy's `pytest; extra == "testing"` makes pluggy depend on pytest
+wherever a development group installs pytest (measured, 7.5.0). The
+action keeps an edge where the declaration applies, and nowhere else:
+its marker holds for the scanned interpreter, with no extra selected or
+with one requested of that distribution. The project takes part like
+any other distribution, its requirements coming from its installed
+metadata or, where uninstalled, from its `pyproject.toml`, optional
+dependencies as the extras they are. Requested extras start from the
+project (`requests[socks]` requests `socks` of requests) and follow
+the edges that apply, including an extra a distribution requests of
+itself (an `all` extra naming `pkg[http]`) and one a dependency
+requests of the project. Everything the runtime graph does not reach,
+development dependencies among it, keeps its own edges in a second
+pass, whose extras never reach a runtime dependency: a development
+tool requiring `requests[socks]` does not make PySocks a runtime
+dependency of requests. The action does not follow extras that a
+development group or requirements file requests directly, rather than
+through an installed package, so it omits those extra-gated edges,
+though the packages remain components. From CycloneDX 1.3, which
+introduced component properties, the `required-extra` properties name
+the extras resolved. Both finished documents must pass the CycloneDX
+schema for `sbom_spec_version` before the action writes either. The
+XML document comes from the same finished JSON one, by
+`cyclonedx-python-lib`, which writes byte-for-byte the XML
+`cyclonedx-py` does (measured, 1.5 and 1.6), so both formats carry
+the same graph and serial number.
+
+**Environment.** Three virtual environments under `RUNNER_TEMP` keep
+the parts apart: one for the package manager and an up-to-date pip, one
+for `cyclonedx-bom`, and one for the project's dependencies, created
+without pip so that it holds those and nothing else. Every module the
+action runs with `python -m` runs isolated (`python -I`), so a
+checkout carrying `venv.py` or `pip.py` cannot replace the module it
+names; the action's own helpers run as a package from the action's
+directory (`python -E -s -m`), which keeps the checkout off the path.
+Every command touching
+the environment runs without
+`PYTHONPATH` or `PYTHONHOME`, either of which would add whatever they
+name to the document. The environment's own interpreter judges
+markers, reporting its marker values run as `python -I -S` so
+that no installed `.pth` file executes, rather than the action assuming
+the interpreter it bound uv to. The action points
+every manager at that last one — uv through `UV_PROJECT_ENVIRONMENT`, PDM
+through `PDM_PYTHON`, ignoring any interpreter a committed
+`.pdm-python` names, Poetry and Pipenv through the active virtual
+environment — so the checkout gains no `.venv`. Lock checks, installs
+and the scan run without the publishing credentials and runner
+variables listed under [Cargo specifics](#cargo-specifics), and without
+`TWINE_PASSWORD`, `UV_PUBLISH_TOKEN`, `UV_PUBLISH_PASSWORD`,
+`PDM_PUBLISH_PASSWORD`, `FLIT_PASSWORD`, `HATCH_INDEX_AUTH` or any
+`POETRY_PYPI_TOKEN_<NAME>`. Index settings such as `PIP_INDEX_URL`
+stay, since resolution may need them. The same caveat holds: defence
+in depth, not a boundary.
+
 ## Verification After Generation
 
-A zero exit code from either backend does not by itself mean a usable
+A zero exit code from a backend does not by itself mean a usable
 document exists, so the action clears the destination paths before
 generating and then checks the artefacts before reporting success:
 
@@ -752,7 +1068,7 @@ rather than quiet successes.
 | sbom_xml_path      | Path to generated XML SBOM file                                 |
 | component_count    | Number of components in the generated SBOM                      |
 | backend            | SBOM generation backend used                                    |
-| dependency_manager | Build tool the `cyclonedx` backend drove                        |
+| dependency_manager | Build tool or package manager the backend drove                 |
 | skipped            | `true` when the action declined to generate                     |
 | image_count        | Image mode: number of images described                          |
 | sboms_json         | Image mode: JSON array describing each image SBOM               |
@@ -772,7 +1088,8 @@ mode. See [Container images](#container-images).
 
 `dependency_manager` reports the build system the `cyclonedx` backend
 drove, since the backend name identifies the tool rather than the build
-system. It stays empty for `syft`.
+system, or the package manager the `python` backend installed with. It
+stays empty for `syft`.
 
 `skipped` reports `true` when the action declined to generate. Two
 conditions cause that:
@@ -797,12 +1114,14 @@ than inferring it from empty build-tool metadata.
 
 ## Path Constraints
 
-Relative values for `path_prefix`, `image_archive_directory` and
-`output_directory` resolve against `GITHUB_WORKSPACE`, not the current
-working directory, so behaviour stays deterministic when a calling
-workflow sets a custom working directory. The action checks the
-directory inputs against the runner filesystem before use:
-`path_prefix` must resolve within `GITHUB_WORKSPACE`, and
+Relative values for `path_prefix`, `cargo_working_directory`,
+`image_archive_directory` and `output_directory` resolve against
+`GITHUB_WORKSPACE`, not the current working directory, so behaviour
+stays deterministic when a calling workflow sets a custom working
+directory. The action checks the directory inputs against the runner
+filesystem before use: `path_prefix` must resolve within
+`GITHUB_WORKSPACE`, `cargo_working_directory` to `path_prefix` or a
+directory beneath it, and
 `image_archive_directory` and `output_directory` must resolve within
 `GITHUB_WORKSPACE` or `RUNNER_TEMP`. Paths that escape these
 locations fail the action, preventing scans or writes against
@@ -886,6 +1205,18 @@ including the build-dependencies of dependencies (such as `cc` under a
 `-sys` crate), and logs a warning that dev-dependencies stay absent. A
 crate that is both a normal and a build dependency keeps the scope
 `required` either way.
+
+**For Python, `include_dev` selects what installs**, because
+`cyclonedx-py` describes whatever the environment holds. Each manager's
+own notion of a development dependency applies — every group uv's
+`default-groups` names (`dev` unless the project says otherwise), PDM's
+development groups, Poetry's non-optional groups, Pipenv's
+`[dev-packages]`, and for pip a `requirements-dev.txt` or PEP 735 `dev`
+group; see [Python specifics](#python-specifics) for the commands.
+Development dependencies join the document as components, and never as
+edges from the root: the project does not depend on them at runtime.
+No component carries a CycloneDX `scope`, which `cyclonedx-py` leaves
+unset.
 
 ## Monorepo and Nested Module Support
 
@@ -1085,6 +1416,67 @@ registry image directly,
 [grype-scan-action](https://github.com/lfreleng-actions/grype-scan-action)
 accepts a `registry:` target.
 
+## Migrating from python-sbom-action
+
+The `python` backend replaces
+[python-sbom-action](https://github.com/lfreleng-actions/python-sbom-action).
+Every input that action took keeps its name, meaning and default here
+(`python_version`, `include_dev`, `sbom_format`, `sbom_spec_version`,
+`filename_prefix`, `output_directory`, `path_prefix` and
+`fail_on_error`), and so does every output (`sbom_json_path`,
+`sbom_xml_path`, `component_count` and `dependency_manager`, with the
+same manager names). Switching takes a different `uses:` and a
+`backend` input:
+
+<!-- markdownlint-disable MD046 -->
+
+```yaml
+- name: "Generate SBOM"
+  id: sbom
+  uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    backend: python
+    # Where this job holds nothing an earlier job running the same
+    # checkout lacked; see Untrusted checkouts
+    untrusted_checkout: 'false'
+    path_prefix: ${{ inputs.path_prefix }}
+    include_dev: ${{ inputs.sbom_include_dev }}
+    sbom_format: ${{ inputs.sbom_format }}
+```
+
+<!-- markdownlint-enable MD046 -->
+
+What changes:
+
+- **Untrusted checkouts skip.** python-sbom-action ran on any
+  checkout. Here `untrusted_checkout: 'auto'` skips a fork pull
+  request; see [Untrusted checkouts](#untrusted-checkouts). A workflow
+  passes `'false'` where its SBOM job holds no permissions, secrets or
+  runner beyond those of an earlier job that ran the same checkout.
+- **A soft failure publishes nothing.** Under `fail_on_error: 'false'`
+  python-sbom-action warned about a stale lock or failed install and
+  generated anyway, from whatever had installed. Here the run warns,
+  writes no document and reports `component_count: 0`, as every
+  backend does: a partial SBOM reads as a clean scan. A project with no
+  Python files at all fails whatever `fail_on_error` says. The default,
+  `'true'`, fails as before.
+- **Counts fall.** `cyclonedx-bom`'s own dependency tree, which
+  python-sbom-action installed into the environment it scanned, no
+  longer appears, so `component_count` drops by that much.
+- **The document has a root.** `metadata.component` names the project
+  wherever `pyproject.toml` carries a `[project]` table, and its
+  `dependsOn` lists the direct dependencies.
+- **A project carrying `pyproject.toml` alone** gets an SBOM of its
+  dependencies, not of the runner's Python.
+- **Paths stay confined.** Relative `path_prefix` and `output_directory`
+  values resolve against `GITHUB_WORKSPACE` rather than the working
+  directory, must stay within the workspace (or `RUNNER_TEMP` for the
+  output), and `filename_prefix` takes `A-Z a-z 0-9 . _ -` alone. See
+  [Path Constraints](#path-constraints).
+- **The job's Python stays untouched.** python-sbom-action left the
+  Python it installed on `PATH` for the steps after it; this action
+  does not change `PATH`.
+
 ## Workflow Integration
 
 The reusable workflows in this organisation keep SBOM generation and
@@ -1115,9 +1507,9 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features` and `cargo_no_default_features` inputs against restricted value sets before use; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` backend this step also resolves the trust decision and the build system, failing fast on one it cannot drive before installing any toolchain, skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
-2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java` for Maven and Gradle, or for Cargo installs `cargo-cyclonedx` (and `cyclonedx-cli` for XML output) via the pinned `taiki-e/install-action`. The selected backend and build tool guard each step, so none costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
+1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features`, `cargo_no_default_features`, `python_version` and `cyclonedx_py_version` inputs against restricted value sets before use, including that a declared `dependency_manager` belongs to the selected backend; verifies the project directory exists, or in image mode the archive directory, and that any `cargo_working_directory` lies within the project directory on a run that drives Cargo; and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` and `python` backends this step also resolves the trust decision and the build system or package manager, failing fast on a project it cannot drive before installing any toolchain; for `cyclonedx` it skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
+2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java` for Maven and Gradle, or for Cargo installs `cargo-cyclonedx` (and `cyclonedx-cli` for XML output) via the pinned `taiki-e/install-action`. For the `python` backend, installs Python via the pinned `actions/setup-python` without changing the job's environment. The selected backend and build tool guard each step, so none costs anything when unused
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. For Python, the action installs the package manager and `cyclonedx-bom` into environments of their own, checks the lock, installs the project's dependencies into a third environment, anchors the root on the project's `[project]` table, runs `cyclonedx-py environment` against that environment once, then gives every component the edges whose declaration applies, checks the result against the schema and writes both formats from that one document. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
 4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary, which for Cargo names the feature selection; in image mode, the image count, manifest, its path, and the list of files written
 
 <!-- markdownlint-enable MD013 -->
@@ -1136,13 +1528,14 @@ would leave behind a document the caller did not request, which the
   contract)
 - The `syft` backend reads lockfiles/manifests without installing
   project dependencies, so generation is fast and needs no language
-  toolchain. The `cyclonedx` backend necessarily gives up that property:
-  resolving a Maven dependency graph requires Maven, and a Cargo one
-  requires cargo
-- For Python projects, prefer
-  [python-sbom-action](https://github.com/lfreleng-actions/python-sbom-action):
-  its environment-based generation gives higher-fidelity results for
-  resolved Python dependency graphs
+  toolchain. The `cyclonedx` and `python` backends necessarily give up
+  that property: resolving a Maven dependency graph requires Maven, a
+  Cargo one requires cargo, and describing a Python environment
+  requires installing it
+- For Python projects, use `backend: python`. Its environment-based
+  generation describes what the resolver actually installed, with
+  markers applied, and anchors the graph on the project; the `syft`
+  backend reads lock files without either
 - For Java projects, use `backend: cyclonedx` rather than the default. The
   `syft` backend will produce an SBOM for a Maven project, but one that
   omits transitive dependencies and reports BOM-managed versions as

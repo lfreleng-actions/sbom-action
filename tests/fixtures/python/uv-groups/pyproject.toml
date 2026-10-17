@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# uv installs every group default-groups names, not only 'dev'. With
+# include_dev 'false' neither development group may reach the SBOM:
+# pluggy ('dev') and six ('typing') must both stay out.
+[project]
+name = "sbom-fixture-uv-groups"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "iniconfig==2.1.0",
+]
+
+[dependency-groups]
+dev = ["pluggy==1.6.0"]
+typing = ["six==1.17.0"]
+
+[tool.uv]
+default-groups = ["dev", "typing"]
