@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# The self-test inserts a line after the iniconfig pin to make
+# this fixture fail to install; keep that pin on a line of its own.
+iniconfig==2.1.0
+python-dateutil==2.9.0.post0
+six==1.17.0

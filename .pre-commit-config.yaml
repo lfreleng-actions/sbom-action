@@ -106,6 +106,12 @@ repos:
     rev: a11caebebdbf797e1e96611123db279b334a7675  # frozen: 1.40.2
     hooks:
       - id: basedpyright
+        # scripts/python_backend.py runs beside cyclonedx-bom, which
+        # brings packaging; the checker needs it to resolve the import.
+        # cyclonedx-python-lib is stubbed under typings/ instead: as a
+        # dependency here it pushes this environment, which carries a
+        # Node.js runtime, past pre-commit.ci's 250 MiB limit.
+        additional_dependencies: [packaging]
 
   - repo: https://github.com/lfreleng-actions/gha-workflow-linter
     rev: 8fa42d5748a293016a8d467618f3e7ee7eac9c3a  # frozen: v1.8.1
