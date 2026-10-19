@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# .python-version asks uv for 3.14, but python_version decides: the
+# action binds uv to its interpreter and lets it download none. The
+# markers make the choice visible in the SBOM. On the default 3.12,
+# iniconfig stays out and six is a direct dependency; on 3.14 it would
+# be the other way round (python-sbom-action#151).
+[project]
+name = "sbom-fixture-uv-pinned"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "iniconfig==2.1.0; implementation_version >= '3.14'",
+    "python-dateutil==2.9.0.post0",
+    "six==1.17.0; implementation_version < '3.14'",
+]

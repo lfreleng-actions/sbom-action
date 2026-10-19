@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Anchors the SBOM: the requirements files install the
+# environment, and this names the root and its direct dependencies.
+[project]
+name = "sbom-fixture-pip-tools"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "iniconfig==2.1.0",
+    "python-dateutil==2.9.0.post0",
+]

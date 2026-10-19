@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# The self-test inserts a line after the iniconfig pin to make
+# this fixture inconsistent; keep that pin on a line of its own.
+[project]
+name = "sbom-fixture-poetry"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "iniconfig==2.1.0",
+    "python-dateutil==2.9.0.post0",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+pluggy = "1.6.0"

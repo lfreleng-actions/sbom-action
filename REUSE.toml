@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+version = 1
+
+# Generated lock files cannot carry a header: Pipfile.lock is JSON, and
+# the TOML locks are rewritten whole by the tools that own them. A
+# .python-version holds a version and nothing else.
+[[annotations]]
+path = [
+  "tests/fixtures/python/*/*.lock",
+  "tests/fixtures/python/*/.python-version",
+]
+SPDX-License-Identifier = "Apache-2.0"
+SPDX-FileCopyrightText = "2026 The Linux Foundation"
