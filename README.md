@@ -446,9 +446,10 @@ exists.
 For Cargo the backend installs no JDK. It needs a **Rust toolchain on
 the runner** (`cargo` on `PATH`); GitHub-hosted images ship `rustup`,
 and the run fails before installing anything where `cargo` is absent.
-The action pins no toolchain: cargo runs from the project directory,
-where the project's `rust-toolchain.toml` applies and `rustup` may
-install the toolchain it names. A caller wanting a particular toolchain
+The action pins no toolchain: cargo runs from the project directory, or
+from `cargo_working_directory` where set, and the `rust-toolchain.toml`
+found from there applies, so `rustup` may install the toolchain it
+names. A caller wanting a particular toolchain
 sets it up before this action.
 
 `taiki-e/install-action` fetches `cargo-cyclonedx`, and for XML
@@ -518,31 +519,35 @@ surfaces regardless of the backend in use.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                      | Required | Default   | Description                                                                                                      |
-| ------------------------- | -------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
-| dependency_manager        | False    | `auto`    | `auto`; `maven`, `gradle` or `cargo` (cyclonedx); `uv`, `pdm`, `poetry`, `pipenv`, `pip-tools` or `pip` (python) |
-| untrusted_checkout        | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`                                                             |
-| java_version              | False    | `21`      | JDK version for the cyclonedx backend                                                                            |
-| java_distribution         | False    | `temurin` | JDK distribution for the cyclonedx backend                                                                       |
-| maven_plugin_version      | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer                                                               |
-| maven_args                | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace                                                  |
-| gradle_plugin_version     | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer                                                              |
-| gradle_version            | False    | `''`      | Gradle version the project uses; empty asks the build tool                                                       |
-| gradle_args               | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace                                                 |
-| cargo_cyclonedx_version   | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                                                                      |
-| cyclonedx_cli_version     | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo                                                       |
-| cargo_target              | False    | `all`     | Cargo: `all` targets, or one target triple to describe                                                           |
-| cargo_features            | False    | `''`      | Cargo: features to activate, separated by whitespace or commas; `package/feature` allowed                        |
-| cargo_all_features        | False    | `false`   | Cargo: activate all features (`--all-features`)                                                                  |
-| cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                                                |
-| python_version            | False    | `3.12`    | Python for the python backend's tools and environment; `3.10` or newer                                           |
-| cyclonedx_py_version      | False    | `7.5.0`   | `cyclonedx-bom` (`cyclonedx-py`) version for the python backend; `4.0.0` or newer                                |
+| Name                      | Required | Default   | Description                                                                                                                 |
+| ------------------------- | -------- | --------- | --------------------------------------------------------------------------------------------------------------------------- |
+| dependency_manager        | False    | `auto`    | `auto`; `maven`, `gradle` or `cargo` (cyclonedx); `uv`, `pdm`, `poetry`, `pipenv`, `pip-tools` or `pip` (python)            |
+| untrusted_checkout        | False    | `auto`    | Is the checkout untrusted: `auto`, `true` or `false`                                                                        |
+| java_version              | False    | `21`      | JDK version for the cyclonedx backend                                                                                       |
+| java_distribution         | False    | `temurin` | JDK distribution for the cyclonedx backend                                                                                  |
+| maven_plugin_version      | False    | `2.9.3`   | `cyclonedx-maven-plugin` version; `2.8.0` or newer                                                                          |
+| maven_args                | False    | `''`      | Extra arguments appended to the Maven call, split on whitespace                                                             |
+| gradle_plugin_version     | False    | `3.4.1`   | `cyclonedx-gradle-plugin` version; `3.0.0` or newer                                                                         |
+| gradle_version            | False    | `''`      | Gradle version the project uses; empty asks the build tool                                                                  |
+| gradle_args               | False    | `''`      | Extra arguments appended to the Gradle call, split on whitespace                                                            |
+| cargo_cyclonedx_version   | False    | `0.5.9`   | `cargo-cyclonedx` version; `0.5.5` or newer                                                                                 |
+| cyclonedx_cli_version     | False    | `0.33.1`  | `cyclonedx-cli` version; writes the XML document for Cargo                                                                  |
+| cargo_target              | False    | `all`     | Cargo: `all` targets, or one target triple to describe                                                                      |
+| cargo_features            | False    | `''`      | Cargo: features to activate, separated by whitespace or commas; `package/feature` allowed                                   |
+| cargo_all_features        | False    | `false`   | Cargo: activate all features (`--all-features`)                                                                             |
+| cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                                                           |
+| cargo_working_directory   | False    | `''`      | Cargo: directory to run Cargo from, `path_prefix` or beneath it; empty runs it from `path_prefix`                           |
+| cargo_version             | False    | `''`      | Cargo: SemVer 2.0 release version to describe in place of every member's `0.0.0`; empty describes the checkout as committed |
+| python_version            | False    | `3.12`    | Python for the python backend's tools and environment; `3.10` or newer                                                      |
+| cyclonedx_py_version      | False    | `7.5.0`   | `cyclonedx-bom` (`cyclonedx-py`) version for the python backend; `4.0.0` or newer                                           |
 
 <!-- markdownlint-enable MD013 -->
 
 A declared `dependency_manager` must belong to the backend selected:
 `uv` with `backend: cyclonedx` fails, as does `maven` with
 `backend: python`. The `syft` backend ignores the input.
+`cargo_working_directory` and `cargo_version` fail any run that drives
+no Cargo; see [Cargo specifics](#cargo-specifics).
 
 #### Choosing the build tool
 
@@ -809,6 +814,119 @@ their package as components and appear nowhere in the graph.
 `metadata.tools` lists `cargo-cyclonedx` in the 1.4 form, a list, at
 spec 1.5 too.
 
+**Working directory.** Cargo reads `.cargo/config.toml`, and `rustup`
+reads `rust-toolchain.toml`, from the directory it runs in and each
+directory above it, not from the manifest. The action runs Cargo from
+`path_prefix` by default, so with `path_prefix` at a workspace root a
+configuration in a member directory does not apply. Where the build runs
+Cargo from that member, a source replacement, `[patch]` or registry
+setting there can then fail the lockfile check, or resolve a graph
+other than the one the build used (measured). `cargo_working_directory`
+runs Cargo from that directory instead, while `path_prefix` still
+decides what the document describes:
+
+```yaml
+- uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    backend: cyclonedx
+    dependency_manager: cargo
+    path_prefix: '.'
+    cargo_working_directory: 'crates/cli'
+```
+
+Every Cargo call then runs from `crates/cli`: `cargo --version`,
+`cargo locate-project`, `cargo generate-lockfile`, `cargo metadata` and
+`cargo-cyclonedx`, and each one that reads a manifest names
+`<path_prefix>/Cargo.toml` through `--manifest-path`. The value resolves
+against `GITHUB_WORKSPACE` as `path_prefix` does, symlinks followed, and
+has to name `path_prefix` itself or a directory beneath it. Validation
+refuses anything else, and the action checks again at the point of
+use, before running Cargo. Left empty, the default, Cargo runs from
+`path_prefix` and every call stays as before.
+
+The input applies to Cargo alone. Unlike the other `cargo_*` inputs, a
+non-empty value fails a run with another backend or build tool rather
+than going unused, because a caller who sets it expects the SBOM to
+follow that directory's configuration. An untrusted checkout skips
+before detecting a build tool, so there the backend and a declared
+`dependency_manager` decide alone.
+
+**Release version.** A tag-versioned project keeps the placeholder
+`0.0.0` as every workspace member's version, in each `Cargo.toml` and
+in `Cargo.lock`, and takes its release version from a git tag.
+[rust-build-action](https://github.com/lfreleng-actions/rust-build-action)
+and
+[rust-crate-publish-action](https://github.com/lfreleng-actions/rust-crate-publish-action)
+write that version over the placeholder before they build and
+publish. Described as committed, such a checkout yields an SBOM naming
+every crate of the project `0.0.0`. `cargo_version` applies the same
+rewrite first; pass it the version the build received:
+
+```yaml
+- uses: lfreleng-actions/sbom-action@<sha>
+  with:
+    backend: cyclonedx
+    dependency_manager: cargo
+    cargo_version: '1.4.0'
+```
+
+The value takes the form those actions accept: SemVer 2.0, such as
+`1.4.0` or `1.4.0-rc.1+build.5`, without a leading `v`. Validation
+refuses anything else, and its error message leaves the value out.
+With a version set, the action:
+
+1. Lists the workspace members with
+   `cargo metadata --no-deps --locked` and requires each one to carry
+   `0.0.0`. A member at any other version fails the run, which names
+   that member: the release would otherwise ship versions the
+   document does not describe.
+2. Copies the root `Cargo.toml`, each member's `Cargo.toml` and
+   `Cargo.lock`, then rewrites them in place. Each must be a regular
+   file, not a symlink, below the workspace root and inside
+   `GITHUB_WORKSPACE`. In a manifest, the rewrite changes a
+   double-quoted `0.0.0` given to a `version` key, optionally after
+   `=`, `^` or `~`: the `[package]` and `[workspace.package]` versions,
+   and requirements on members. In `Cargo.lock`, it changes the
+   members' own `[[package]]` entries and references to them. A
+   registry crate keeps its version, and each line keeps its CRLF or
+   LF ending.
+3. Requires `cargo metadata` to report the new version for every
+   member, then describes the project as without the input.
+4. Writes each copy back on the way out, after a failure too, leaving
+   the checkout as committed. Each file must then read back as its
+   copy. If one does not, after a full disk say, the run fails
+   whatever `fail_on_error` says and writes no document. The action
+   then keeps the copies, the one record of the original bytes, and
+   names each file and its copy in an error annotation.
+
+The document then carries the release version in `metadata.component`,
+in each member's component, and in their `purl` and `bom-ref` values,
+such as `path+file:///<checkout>/core#name@1.4.0`, and no `0.0.0`
+remains. The rewrite happens in place, as the build's does, rather
+than in a private copy of the tree: `cargo-cyclonedx` names a path
+dependency by its absolute path, and a copy would put a scratch path
+into every `bom-ref`.
+
+`scripts/cargo_version_stamp.sh` performs the rewrite: text
+processing, running no Cargo command and no project code. It follows
+revision 3 of the version-stamp specification the two Rust actions
+share, its awk programs copied byte for byte from
+rust-crate-publish-action's reference implementation, and all three
+actions test it against the same vectors, in
+`tests/fixtures/version-stamp*/`.
+
+**Known limitation.** The manifest rule works line by line and does
+not parse TOML. A literal (single-quoted) or multi-line string holding
+the exact text `version = "0.0.0"` after whitespace, `{` or `,`
+changes too. The Rust actions rewrite such a string identically, and
+the SBOM still matches what they ship.
+
+Like `cargo_working_directory`, a non-empty `cargo_version` fails a
+run with another backend or build tool rather than going unused:
+ignored, it would leave an SBOM naming the project's crates `0.0.0`
+beside a release that ships another version. Left empty, the default,
+the action describes the checkout as committed.
+
 **Environment.** cargo and `cargo-cyclonedx` run without
 `CARGO_REGISTRY_TOKEN`, any `CARGO_REGISTRIES_<NAME>_TOKEN`, the GitHub
 OIDC request variables, `ACTIONS_RUNTIME_TOKEN`, or the paths of the
@@ -1073,12 +1191,14 @@ than inferring it from empty build-tool metadata.
 
 ## Path Constraints
 
-Relative values for `path_prefix`, `image_archive_directory` and
-`output_directory` resolve against `GITHUB_WORKSPACE`, not the current
-working directory, so behaviour stays deterministic when a calling
-workflow sets a custom working directory. The action checks the
-directory inputs against the runner filesystem before use:
-`path_prefix` must resolve within `GITHUB_WORKSPACE`, and
+Relative values for `path_prefix`, `cargo_working_directory`,
+`image_archive_directory` and `output_directory` resolve against
+`GITHUB_WORKSPACE`, not the current working directory, so behaviour
+stays deterministic when a calling workflow sets a custom working
+directory. The action checks the directory inputs against the runner
+filesystem before use: `path_prefix` must resolve within
+`GITHUB_WORKSPACE`, `cargo_working_directory` to `path_prefix` or a
+directory beneath it, and
 `image_archive_directory` and `output_directory` must resolve within
 `GITHUB_WORKSPACE` or `RUNNER_TEMP`. Paths that escape these
 locations fail the action, preventing scans or writes against
@@ -1464,10 +1584,10 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features`, `cargo_no_default_features`, `python_version` and `cyclonedx_py_version` inputs against restricted value sets before use, including that a declared `dependency_manager` belongs to the selected backend; verifies the project directory exists, or in image mode the archive directory, and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` and `python` backends this step also resolves the trust decision and the build system or package manager, failing fast on a project it cannot drive before installing any toolchain; for `cyclonedx` it skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
+1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features`, `cargo_no_default_features`, `cargo_version`, `python_version` and `cyclonedx_py_version` inputs against restricted value sets before use, including that a declared `dependency_manager` belongs to the selected backend; verifies the project directory exists, or in image mode the archive directory, and that any `cargo_working_directory` lies within the project directory on a run that drives Cargo; and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` and `python` backends this step also resolves the trust decision and the build system or package manager, failing fast on a project it cannot drive before installing any toolchain; for `cyclonedx` it skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
 2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java` for Maven and Gradle, or for Cargo installs `cargo-cyclonedx` (and `cyclonedx-cli` for XML output) via the pinned `taiki-e/install-action`. For the `python` backend, installs Python via the pinned `actions/setup-python` without changing the job's environment. The selected backend and build tool guard each step, so none costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. For Python, the action installs the package manager and `cyclonedx-bom` into environments of their own, checks the lock, installs the project's dependencies into a third environment, anchors the root on the project's `[project]` table, runs `cyclonedx-py environment` against that environment once, then gives every component the edges whose declaration applies, checks the result against the schema and writes both formats from that one document. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
-4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary, which for Cargo names the feature selection; in image mode, the image count, manifest, its path, and the list of files written
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, writes any `cargo_version` over the members' `0.0.0` placeholder in place and restores the files afterwards, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. For Python, the action installs the package manager and `cyclonedx-bom` into environments of their own, checks the lock, installs the project's dependencies into a third environment, anchors the root on the project's `[project]` table, runs `cyclonedx-py environment` against that environment once, then gives every component the edges whose declaration applies, checks the result against the schema and writes both formats from that one document. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
+4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary, which for Cargo names the feature selection and any `cargo_version`; in image mode, the image count, manifest, its path, and the list of files written
 
 <!-- markdownlint-enable MD013 -->
 

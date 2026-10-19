@@ -22,6 +22,9 @@ repos:
     rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # The shared version-stamp vectors must match the copies in
+        # rust-build-action and rust-crate-publish-action byte for byte.
+        exclude: '^tests/fixtures/version-stamp[^/]*/'
       - id: check-added-large-files
       - id: check-ast
       - id: check-json
@@ -30,9 +33,15 @@ repos:
       - id: check-yaml
       - id: debug-statements
       - id: end-of-file-fixer
+        # The shared version-stamp vectors must match the copies in
+        # rust-build-action and rust-crate-publish-action byte for byte.
+        exclude: '^tests/fixtures/version-stamp[^/]*/'
       - id: requirements-txt-fixer
       - id: mixed-line-ending
         args: ["--fix=lf"]
+        # The shared version-stamp vectors must match the copies in
+        # rust-build-action and rust-crate-publish-action byte for byte.
+        exclude: '^tests/fixtures/version-stamp[^/]*/'
       - id: no-commit-to-branch
         args:
           - --branch=dev

@@ -186,6 +186,16 @@ inputs:
     description: "Cargo projects: do not activate default features ('true'/'false')"
     required: false
     default: "false"
+  cargo_working_directory:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: directory to run Cargo from, path_prefix or beneath it; empty runs it from path_prefix"
+    required: false
+    default: ""
+  cargo_version:
+    # yamllint disable-line rule:line-length
+    description: "Cargo projects: SemVer 2.0 release version to describe in place of every member's 0.0.0 placeholder; empty describes the checkout as committed"
+    required: false
+    default: ""
 
   # Optional, python backend only
   python_version:
@@ -274,6 +284,9 @@ runs:
         INPUT_CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
         # yamllint disable-line rule:line-length
         INPUT_CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
+        # yamllint disable-line rule:line-length
+        INPUT_CARGO_WORKING_DIRECTORY: ${{ inputs.cargo_working_directory }}
+        INPUT_CARGO_VERSION: ${{ inputs.cargo_version }}
         INPUT_PYTHON_VERSION: ${{ inputs.python_version }}
         INPUT_CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
         # Empty for every event that is not a pull request. Compared
@@ -506,6 +519,41 @@ runs:
             echo "uv, pdm, poetry, pipenv, pip-tools or pip"
             exit 1 ;;
         esac
+        # cargo_working_directory is refused, not ignored, wherever no
+        # Cargo runs. A caller sets it so that the SBOM follows the
+        # configuration a build in that directory reads; ignoring it
+        # would describe something else without a word. The backend and
+        # a declared dependency_manager settle it here, and a detected
+        # build tool once detection has run, below. cargo_version gets
+        # the same treatment: ignored, the SBOM would name the
+        # project's crates 0.0.0 beside a release that ships another.
+        for cargo_only in cargo_working_directory cargo_version; do
+          case "${cargo_only}" in
+            cargo_working_directory)
+              cargo_only_value="${INPUT_CARGO_WORKING_DIRECTORY}" ;;
+            cargo_version) cargo_only_value="${INPUT_CARGO_VERSION}" ;;
+          esac
+          [ -n "${cargo_only_value}" ] || continue
+          case "${INPUT_BACKEND}:${INPUT_DEPENDENCY_MANAGER}" in
+            cyclonedx:auto|cyclonedx:cargo) ;;
+            *)
+              echo "Error: ${cargo_only} applies to Cargo projects only ❌"
+              echo "It needs backend 'cyclonedx', with dependency_manager"
+              echo "'cargo' or 'auto' resolving to Cargo"
+              exit 1 ;;
+          esac
+        done
+        # The release version, as rust-build-action and
+        # rust-crate-publish-action take it: SemVer 2.0 without a
+        # leading 'v'. The message never repeats the value.
+        if [ -n "${INPUT_CARGO_VERSION}" ] && ! bash \
+          "${GITHUB_ACTION_PATH}/scripts/cargo_version_stamp.sh" check \
+          "${INPUT_CARGO_VERSION}"; then
+          echo "Error: invalid cargo_version ❌"
+          echo "Expected a SemVer 2.0 version such as 1.2.3 or"
+          echo "1.2.3-rc.1, without a leading 'v'"
+          exit 1
+        fi
         # The Cargo tool versions reach taiki-e/install-action as
         # tool@version specifications, and cargo_target reaches the
         # command line, so all three get the whole-string treatment.
@@ -664,6 +712,43 @@ runs:
               echo "path_prefix must resolve within GITHUB_WORKSPACE"
               exit 1 ;;
           esac
+          # Cargo reads .cargo/config.toml, and rustup
+          # rust-toolchain.toml, from its working directory upward, so
+          # cargo_working_directory gets path_prefix's checks. It must
+          # also be path_prefix or lie beneath it: it selects
+          # configuration within the project described, never another
+          # tree's.
+          if [ -n "${INPUT_CARGO_WORKING_DIRECTORY}" ]; then
+            cargo_dir="${INPUT_CARGO_WORKING_DIRECTORY}"
+            case "${cargo_dir}" in
+              /*) ;;
+              *) cargo_dir="${GITHUB_WORKSPACE}/${cargo_dir}" ;;
+            esac
+            if [ ! -d "${cargo_dir}" ]; then
+              echo "Error: invalid cargo_working_directory ❌"
+              printf 'Path not found: %s\n' \
+                "$(printf '%s' "${cargo_dir}" | tr -d '\r\n')"
+              exit 1
+            fi
+            cargo_dir="$(realpath -- "${cargo_dir}")"
+            case "${cargo_dir}/" in
+              "${workspace}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory escapes the" \
+                  "workspace ❌"
+                echo "It must resolve within GITHUB_WORKSPACE"
+                exit 1 ;;
+            esac
+            case "${cargo_dir}/" in
+              "${resolved}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory lies outside" \
+                  "path_prefix ❌"
+                echo "It must resolve to path_prefix or a directory"
+                echo "beneath it"
+                exit 1 ;;
+            esac
+          fi
         fi
         # The archive directory is read rather than written, but it gets
         # the output_directory boundary all the same: syft records what
@@ -974,6 +1059,23 @@ runs:
             exit 1
           fi
         fi
+        # The detected build tool, for cargo_working_directory and
+        # cargo_version (see above). A skipped run detects none and runs
+        # no Cargo either.
+        for cargo_only in cargo_working_directory cargo_version; do
+          case "${cargo_only}" in
+            cargo_working_directory)
+              cargo_only_value="${INPUT_CARGO_WORKING_DIRECTORY}" ;;
+            cargo_version) cargo_only_value="${INPUT_CARGO_VERSION}" ;;
+          esac
+          if [ -n "${cargo_only_value}" ] && \
+            [ "${skipped}" != "true" ] && \
+            [ "${dependency_manager}" != "cargo" ]; then
+            echo "Error: ${cargo_only} applies to Cargo projects only ❌"
+            echo "The build tool detected is ${dependency_manager}"
+            exit 1
+          fi
+        done
         echo "dependency_manager=${dependency_manager}" >> "$GITHUB_OUTPUT"
 
         # The tools a Cargo run installs, as taiki-e/install-action
@@ -1176,6 +1278,9 @@ runs:
         CARGO_ALL_FEATURES: ${{ inputs.cargo_all_features }}
         # yamllint disable-line rule:line-length
         CARGO_NO_DEFAULT_FEATURES: ${{ inputs.cargo_no_default_features }}
+        # yamllint disable-line rule:line-length
+        CARGO_WORKING_DIRECTORY: ${{ inputs.cargo_working_directory }}
+        CARGO_VERSION: ${{ inputs.cargo_version }}
         PYTHON_CMD: ${{ steps.python.outputs.python-path }}
         PYTHON_VERSION: ${{ inputs.python_version }}
         CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
@@ -1209,6 +1314,28 @@ runs:
               echo "path_prefix must resolve within GITHUB_WORKSPACE"
               exit 1 ;;
           esac
+          # Where Cargo runs: path_prefix, unless cargo_working_directory
+          # names a directory, which is re-resolved here for the same
+          # reason. path_prefix lies within the workspace, so lying
+          # beneath it is the whole test.
+          CARGO_DIR="${PROJECT_DIR}"
+          if [ -n "${CARGO_WORKING_DIRECTORY}" ]; then
+            CARGO_DIR="${CARGO_WORKING_DIRECTORY}"
+            case "${CARGO_DIR}" in
+              /*) ;;
+              *) CARGO_DIR="${GITHUB_WORKSPACE:?}/${CARGO_DIR}" ;;
+            esac
+            CARGO_DIR="$(realpath -- "${CARGO_DIR}")"
+            case "${CARGO_DIR}/" in
+              "${PROJECT_DIR}/"*) ;;
+              *)
+                echo "Error: cargo_working_directory lies outside" \
+                  "path_prefix ❌"
+                echo "It must resolve to path_prefix or a directory"
+                echo "beneath it"
+                exit 1 ;;
+            esac
+          fi
         fi
         # Convert the output directory to an absolute path anchored
         # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
@@ -1929,12 +2056,46 @@ runs:
         # Files a Cargo run creates inside the checkout, removed on the
         # way out so the tree is left as the run found it
         cargo_litter=()
+        # Files cargo_version rewrites inside the checkout, each with a
+        # copy of its bytes taken first, written back on the way out.
+        # Restored before the scratch directory holding the copies goes.
+        cargo_restore_files=()
+        cargo_restore_copies=()
         cleanup_scratch() {
+          local restore restore_failed="" restore_file restore_copy
+          # A write can fail part way, a full disk say, leaving the file
+          # truncated, so each restore must read back as its copy. If
+          # one does not, the copies stay: they hold the only record of
+          # the checkout's bytes. The step then fails, whatever the
+          # outcome and fail_on_error, since later steps would build
+          # or commit a damaged checkout.
+          for restore in "${!cargo_restore_files[@]}"; do
+            if ! cat -- "${cargo_restore_copies[restore]}" \
+              > "${cargo_restore_files[restore]}" || ! cmp -s -- \
+              "${cargo_restore_copies[restore]}" \
+              "${cargo_restore_files[restore]}"; then
+              restore_failed="true"
+              restore_file="${cargo_restore_files[restore]//%/%25}"
+              restore_copy="${cargo_restore_copies[restore]//%/%25}"
+              echo "::error::could not restore ${restore_file} after the" \
+                "cargo_version rewrite; its original bytes remain in" \
+                "${restore_copy}"
+            fi
+          done
           [ -z "${scratch_dir}" ] || rm -rf -- "${scratch_dir}"
           [ -z "${gradle_scratch}" ] || rm -rf -- "${gradle_scratch}"
-          [ -z "${cargo_scratch}" ] || rm -rf -- "${cargo_scratch}"
+          if [ -n "${cargo_scratch}" ] && [ -z "${restore_failed}" ]; then
+            rm -rf -- "${cargo_scratch}"
+          fi
           [ -z "${python_scratch}" ] || rm -rf -- "${python_scratch}"
           [ "${#cargo_litter[@]}" -eq 0 ] || rm -f -- "${cargo_litter[@]}"
+          # A failed run leaves no document, as everywhere else
+          if [ -n "${restore_failed}" ]; then
+            rm -f -- "${json_path}" "${xml_path}"
+            echo "cargo_version: restoring the checkout failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
         }
         trap cleanup_scratch EXIT
 
@@ -1945,7 +2106,7 @@ runs:
 
         backend_failure=""
 
-        # Runs a command from the project directory, for the backends
+        # Runs a command from the directory given first, for the backends
         # that execute code from the checkout or from the packages it
         # names (Cargo through a rustc wrapper, Python through build
         # backends and .pth files), without:
@@ -1962,7 +2123,9 @@ runs:
         # Defence in depth, not a boundary: code running as the same
         # user can still read an ancestor's environment and find the
         # command files at their predictable paths.
-        scrubbed() {
+        scrubbed_in() {
+          local dir="$1"
+          shift
           local -a unset_args=()
           local name
           for name in CARGO_REGISTRY_TOKEN TWINE_PASSWORD \
@@ -1980,8 +2143,12 @@ runs:
                 unset_args+=(-u "${name}") ;;
             esac
           done < <(compgen -e)
-          (cd -- "${PROJECT_DIR}" && \
+          (cd -- "${dir}" && \
             exec env "${unset_args[@]}" "$@")
+        }
+        # The same, from the project directory
+        scrubbed() {
+          scrubbed_in "${PROJECT_DIR}" "$@"
         }
 
         case "${BACKEND}" in
@@ -2492,9 +2659,190 @@ runs:
                 # (measured), and rust-toolchain.toml can select a
                 # toolchain directory inside the checkout. The
                 # untrusted-checkout skip covers Cargo for that reason,
-                # and every cargo call goes through scrubbed (above),
-                # so rustup selects the toolchain the project's
-                # rust-toolchain.toml names.
+                # and every cargo call goes through scrubbed_in (above)
+                # from CARGO_DIR: path_prefix, or cargo_working_directory
+                # where one is given. Cargo reads .cargo/config.toml, and
+                # rustup rust-toolchain.toml, from there upward, so the
+                # SBOM follows the configuration a build run from that
+                # directory sees, while path_prefix still decides the
+                # manifest described.
+
+                # The workspace members as 'cargo metadata --no-deps'
+                # reports them, checked as the shared reference checks
+                # them, into the arrays stamp_names, stamp_versions and
+                # stamp_manifests, and the resolved root into stamp_root.
+                # Names reach the lockfile rule and messages, so they
+                # must be plain crate names.
+                cargo_stamp_members() {
+                  local listing="${cargo_scratch}/stamp-members.json"
+                  local name version manifest
+                  stamp_names=()
+                  stamp_versions=()
+                  stamp_manifests=()
+                  if ! scrubbed_in "${CARGO_DIR}" cargo metadata --no-deps \
+                    --locked --format-version 1 "${manifest_args[@]}" \
+                    > "${listing}"; then
+                    backend_failure="cargo metadata --no-deps --locked failed"
+                    backend_failure+=" while applying cargo_version"
+                    return 1
+                  fi
+                  if ! jq -e '(.workspace_root | type == "string"
+                      and startswith("/") and (test("[[:cntrl:]\\\\]") | not))
+                    and (.workspace_members | type == "array" and length > 0)
+                    and (.workspace_members as $ids
+                      | [.packages[] | select(.id | IN($ids[]))]
+                      | length == ($ids | length)
+                        and all(.[];
+                          (.name | type == "string"
+                            and test("^[A-Za-z0-9_-]+$"))
+                          and (.version | type == "string"
+                            and test("^[0-9A-Za-z.+-]+$"))
+                          and (.manifest_path | type == "string"
+                            and startswith("/")
+                            and (test("[[:cntrl:]\\\\]") | not))))' \
+                    "${listing}" > /dev/null 2>&1; then
+                    backend_failure="cargo metadata returned unexpected"
+                    backend_failure+=" workspace members"
+                    return 1
+                  fi
+                  if ! stamp_root="$(realpath -- "$(jq -r .workspace_root \
+                    "${listing}")")"; then
+                    backend_failure="could not resolve the workspace root"
+                    return 1
+                  fi
+                  while IFS=$'\t' read -r name version manifest; do
+                    stamp_names+=("${name}")
+                    stamp_versions+=("${version}")
+                    stamp_manifests+=("${manifest}")
+                  done < <(jq -r '.workspace_members as $ids | .packages[]
+                    | select(.id | IN($ids[]))
+                    | [.name, .version, .manifest_path] | @tsv' "${listing}")
+                }
+
+                # cargo_version: describe a tag-versioned project at its
+                # release version. Such a project keeps the placeholder
+                # 0.0.0 in every member's Cargo.toml and in Cargo.lock,
+                # and rust-build-action and rust-crate-publish-action
+                # write the release version over it before building and
+                # publishing. This applies the same rewrite, from the
+                # same shared specification (scripts/cargo_version_stamp.sh),
+                # so the SBOM names the crates they ship rather than
+                # 0.0.0, in metadata.component, the member components,
+                # their purls and their bom-refs alike.
+                #
+                # The rewrite happens in place, as the build's does:
+                # cargo describes a path dependency by its absolute
+                # path, so a private copy would put a scratch path into
+                # every bom-ref. A copy of each file's bytes is taken
+                # first and written back on the way out, failures
+                # included, so the checkout ends as the run found it.
+                cargo_stamp_version() {
+                  local -a stamp_names=() stamp_versions=() stamp_manifests=()
+                  local -a candidates=() files=()
+                  local stamp_root i file dir seen duplicate
+                  cargo_stamp_members || return 1
+                  # Every member must carry the placeholder, so the
+                  # given version is the only one the release can carry
+                  for i in "${!stamp_names[@]}"; do
+                    if [ "${stamp_versions[i]}" != "0.0.0" ]; then
+                      backend_failure="cargo_version is set, so every"
+                      backend_failure+=" workspace member must carry the"
+                      backend_failure+=" placeholder version 0.0.0;"
+                      backend_failure+=" ${stamp_names[i]} carries"
+                      backend_failure+=" ${stamp_versions[i]}"
+                      return 1
+                    fi
+                  done
+
+                  # The root manifest, each member's once, and the
+                  # lockfile, each by its resolved path, all regular
+                  # files below the workspace root and the checkout
+                  candidates=("${stamp_root}/Cargo.toml"
+                    "${stamp_manifests[@]}")
+                  if [ -e "${stamp_root}/Cargo.lock" ] || \
+                    [ -L "${stamp_root}/Cargo.lock" ]; then
+                    candidates+=("${stamp_root}/Cargo.lock")
+                  fi
+                  for file in "${candidates[@]}"; do
+                    if [ ! -f "${file}" ] || [ -L "${file}" ]; then
+                      backend_failure="cargo_version needs every manifest"
+                      backend_failure+=" and Cargo.lock to be a regular"
+                      backend_failure+=" file, not a symlink"
+                      return 1
+                    fi
+                    if ! dir="$(realpath -- "$(dirname -- "${file}")")"; then
+                      backend_failure="could not resolve a member manifest"
+                      return 1
+                    fi
+                    file="${dir}/${file##*/}"
+                    case "${file}" in
+                      "${stamp_root}"/*) ;;
+                      *)
+                        backend_failure="cargo_version needs every member's"
+                        backend_failure+=" manifest below the workspace root"
+                        return 1 ;;
+                    esac
+                    case "${file}" in
+                      "${workspace}"/*) ;;
+                      *)
+                        backend_failure="cargo_version needs every file it"
+                        backend_failure+=" rewrites inside the workspace"
+                        return 1 ;;
+                    esac
+                    duplicate="no"
+                    for seen in "${files[@]}"; do
+                      if [ "${seen}" = "${file}" ]; then
+                        duplicate="yes"
+                      fi
+                    done
+                    if [ "${duplicate}" = "no" ]; then
+                      files+=("${file}")
+                    fi
+                  done
+
+                  # Every copy exists before any file changes, and each
+                  # is registered for restoring as it is taken
+                  for i in "${!files[@]}"; do
+                    if ! cp -- "${files[i]}" "${cargo_scratch}/stamp-copy-${i}"
+                    then
+                      backend_failure="could not copy a file before the"
+                      backend_failure+=" cargo_version rewrite"
+                      return 1
+                    fi
+                    cargo_restore_files+=("${files[i]}")
+                    cargo_restore_copies+=("${cargo_scratch}/stamp-copy-${i}")
+                  done
+                  for file in "${files[@]}"; do
+                    if [ "${file}" = "${stamp_root}/Cargo.lock" ]; then
+                      set -- lockfile "${CARGO_VERSION}" "${file}" \
+                        "${stamp_names[@]}"
+                    else
+                      set -- manifest "${CARGO_VERSION}" "${file}"
+                    fi
+                    if ! bash \
+                      "${GITHUB_ACTION_PATH}/scripts/cargo_version_stamp.sh" \
+                      "$@" > /dev/null; then
+                      backend_failure="the cargo_version rewrite failed"
+                      return 1
+                    fi
+                  done
+
+                  # Every member must now report the given version; a
+                  # requirement the rule rewrote by mistake fails here
+                  # or in the next --locked call
+                  cargo_stamp_members || return 1
+                  for i in "${!stamp_names[@]}"; do
+                    if [ "${stamp_versions[i]}" != "${CARGO_VERSION}" ]; then
+                      backend_failure="after the cargo_version rewrite,"
+                      backend_failure+=" ${stamp_names[i]} reports version"
+                      backend_failure+=" ${stamp_versions[i]}"
+                      return 1
+                    fi
+                  done
+                  echo "Describing cargo_version in place of 0.0.0 for" \
+                    "${#stamp_names[@]} member(s), in ${#files[@]} file(s)" \
+                    "restored afterwards"
+                }
 
                 # Sets backend_failure and returns non-zero on any
                 # failure; 'set -e' does not apply inside a function
@@ -2504,6 +2852,7 @@ runs:
                   local metadata project_manifest whole gen_name
                   local member produced count serial hex
                   local -a members=() docs=() feature_args=()
+                  local -a manifest_args=()
 
                   # The binaries themselves, not 'cargo cyclonedx':
                   # cargo resolves a subcommand through aliases in the
@@ -2539,9 +2888,20 @@ runs:
                     fi
                   fi
 
-                  echo "Rust toolchain: $(scrubbed cargo --version || true)"
-                  if ! ws_manifest="$(scrubbed cargo locate-project \
-                    --workspace --message-format plain)"; then
+                  # From cargo_working_directory, cargo would look for a
+                  # manifest from there upward, so each call that does
+                  # not name one already names path_prefix's. Unset,
+                  # Cargo runs from path_prefix and no call changes.
+                  if [ -n "${CARGO_WORKING_DIRECTORY}" ]; then
+                    manifest_args=(--manifest-path "${PROJECT_DIR}/Cargo.toml")
+                    printf 'Cargo working directory: %s\n' \
+                      "$(printf '%s' "${CARGO_DIR}" | tr -d '\r\n')"
+                  fi
+                  echo "Rust toolchain: $(scrubbed_in "${CARGO_DIR}" \
+                    cargo --version || true)"
+                  if ! ws_manifest="$(scrubbed_in "${CARGO_DIR}" \
+                    cargo locate-project --workspace --message-format plain \
+                    "${manifest_args[@]}")"; then
                     backend_failure="cargo could not locate the workspace"
                     return 1
                   fi
@@ -2560,10 +2920,14 @@ runs:
                       "dependencies as they resolve now; commit Cargo.lock" \
                       "to describe a pinned graph"
                     cargo_litter+=("${lockfile}")
-                    if ! scrubbed cargo generate-lockfile; then
+                    if ! scrubbed_in "${CARGO_DIR}" cargo generate-lockfile \
+                      "${manifest_args[@]}"; then
                       backend_failure="cargo could not resolve a lockfile"
                       return 1
                     fi
+                  fi
+                  if [ -n "${CARGO_VERSION}" ] && ! cargo_stamp_version; then
+                    return 1
                   fi
                   # The feature selection as cargo flags, each only when
                   # set, so the defaults leave both calls below as they
@@ -2586,7 +2950,8 @@ runs:
                     feature_args+=(--no-default-features)
                   fi
                   metadata="${cargo_scratch}/metadata.json"
-                  if ! scrubbed cargo metadata --locked --format-version 1 \
+                  if ! scrubbed_in "${CARGO_DIR}" cargo metadata --locked \
+                    --format-version 1 "${manifest_args[@]}" \
                     "${feature_args[@]}" > "${metadata}"; then
                     backend_failure="cargo metadata --locked failed; is"
                     backend_failure+=" Cargo.lock up to date"
@@ -2657,7 +3022,7 @@ runs:
                     "${CARGO_CYCLONEDX_VERSION} (build-dependencies:" \
                     "${INCLUDE_DEV}, target: ${CARGO_TARGET}," \
                     "features: ${cargo_selection})"
-                  if ! scrubbed env -u CARGO_BUILD_TARGET \
+                  if ! scrubbed_in "${CARGO_DIR}" env -u CARGO_BUILD_TARGET \
                     "${cdx_bin}" cyclonedx "$@"; then
                     backend_failure="cargo-cyclonedx failed"
                     return 1
@@ -3269,6 +3634,11 @@ runs:
           fi
           if [ -n "${cargo_selection:-}" ]; then
             echo "**Cargo Features:** \`${cargo_selection}\`"
+          fi
+          if [ "${DEPENDENCY_MANAGER}" = "cargo" ] && \
+            [ -n "${CARGO_VERSION}" ]; then
+            echo "**Cargo Version:** \`${CARGO_VERSION}\` in place of" \
+              "\`0.0.0\`"
           fi
           echo "**Format:** ${SBOM_FORMAT}"
           echo "**Specification Version:** ${SPEC_VERSION}"
