@@ -13,3 +13,16 @@ path = [
 ]
 SPDX-License-Identifier = "Apache-2.0"
 SPDX-FileCopyrightText = "2026 The Linux Foundation"
+
+# The version-stamp test vectors are shared, byte for byte, with
+# lfreleng-actions/rust-build-action and rust-crate-publish-action, so
+# they carry no header.
+[[annotations]]
+path = [
+  "tests/fixtures/version-stamp/**",
+  "tests/fixtures/version-stamp-crlf/**",
+  "tests/fixtures/version-stamp-inline/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 The Linux Foundation"
+SPDX-License-Identifier = "Apache-2.0"
