@@ -893,7 +893,11 @@ With a version set, the action:
 3. Requires `cargo metadata` to report the new version for every
    member, then describes the project as without the input.
 4. Writes each copy back on the way out, after a failure too, leaving
-   the checkout as committed.
+   the checkout as committed. Each file must then read back as its
+   copy. If one does not, after a full disk say, the run fails
+   whatever `fail_on_error` says and writes no document. The action
+   then keeps the copies, the one record of the original bytes, and
+   names each file and its copy in an error annotation.
 
 The document then carries the release version in `metadata.component`,
 in each member's component, and in their `purl` and `bom-ref` values,

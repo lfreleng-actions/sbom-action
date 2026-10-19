@@ -2062,19 +2062,40 @@ runs:
         cargo_restore_files=()
         cargo_restore_copies=()
         cleanup_scratch() {
-          local restore
+          local restore restore_failed="" restore_file restore_copy
+          # A write can fail part way, a full disk say, leaving the file
+          # truncated, so each restore must read back as its copy. If
+          # one does not, the copies stay: they hold the only record of
+          # the checkout's bytes. The step then fails, whatever the
+          # outcome and fail_on_error, since later steps would build
+          # or commit a damaged checkout.
           for restore in "${!cargo_restore_files[@]}"; do
             if ! cat -- "${cargo_restore_copies[restore]}" \
-              > "${cargo_restore_files[restore]}"; then
-              echo "::warning::could not restore a file cargo_version" \
-                "rewrote; the checkout may still hold the stamped version"
+              > "${cargo_restore_files[restore]}" || ! cmp -s -- \
+              "${cargo_restore_copies[restore]}" \
+              "${cargo_restore_files[restore]}"; then
+              restore_failed="true"
+              restore_file="${cargo_restore_files[restore]//%/%25}"
+              restore_copy="${cargo_restore_copies[restore]//%/%25}"
+              echo "::error::could not restore ${restore_file} after the" \
+                "cargo_version rewrite; its original bytes remain in" \
+                "${restore_copy}"
             fi
           done
           [ -z "${scratch_dir}" ] || rm -rf -- "${scratch_dir}"
           [ -z "${gradle_scratch}" ] || rm -rf -- "${gradle_scratch}"
-          [ -z "${cargo_scratch}" ] || rm -rf -- "${cargo_scratch}"
+          if [ -n "${cargo_scratch}" ] && [ -z "${restore_failed}" ]; then
+            rm -rf -- "${cargo_scratch}"
+          fi
           [ -z "${python_scratch}" ] || rm -rf -- "${python_scratch}"
           [ "${#cargo_litter[@]}" -eq 0 ] || rm -f -- "${cargo_litter[@]}"
+          # A failed run leaves no document, as everywhere else
+          if [ -n "${restore_failed}" ]; then
+            rm -f -- "${json_path}" "${xml_path}"
+            echo "cargo_version: restoring the checkout failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
         }
         trap cleanup_scratch EXIT
 

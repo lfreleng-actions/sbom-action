@@ -2988,8 +2988,11 @@ jobs:
       # Cargo.toml and Cargo.lock beside that manifest as they stand
       # while it runs, which proves the rewrite was in place then. With
       # SBOM_SPY_FAIL set, that same call fails, so a run fails after
-      # the rewrite and must still restore every file. The single
-      # quotes are deliberate: the wrapper expands them.
+      # the rewrite and must still restore every file. With
+      # SBOM_SPY_BLOCK naming a file beside that manifest, the call
+      # succeeds and then puts a directory in that file's place, so no
+      # write can restore it. The single quotes are deliberate: the
+      # wrapper expands them.
       - name: "Install the cargo-cyclonedx version spy"
         shell: bash
         run: |
@@ -2999,27 +3002,35 @@ jobs:
           mkdir -p "${spy_dir}"
           # shellcheck disable=SC2016
           printf '%s\n' '#!/bin/sh' \
+            'dir=""' \
             'prev=""' \
             'for arg in "$@"; do' \
             '  if [ "${prev}" = "--manifest-path" ]; then' \
             '    dir="$(dirname "${arg}")"' \
-            '    log="${SBOM_STAMP_LOG:-}"' \
-            '    if [ -n "${log}" ]; then' \
-            '      cat "${dir}/Cargo.toml" "${dir}/Cargo.lock" > "${log}"' \
-            '    fi' \
-            '    if [ -n "${SBOM_SPY_FAIL:-}" ]; then' \
-            '      echo "cargo-cyclonedx spy: failing on purpose" >&2' \
-            '      exit 1' \
-            '    fi' \
             '  fi' \
             '  prev="${arg}"' \
             'done' \
+            'log="${SBOM_STAMP_LOG:-}"' \
+            'if [ -n "${dir}" ] && [ -n "${log}" ]; then' \
+            '  cat "${dir}/Cargo.toml" "${dir}/Cargo.lock" > "${log}"' \
+            'fi' \
+            'if [ -n "${dir}" ] && [ -n "${SBOM_SPY_FAIL:-}" ]; then' \
+            '  echo "cargo-cyclonedx spy: failing on purpose" >&2' \
+            '  exit 1' \
+            'fi' \
             'self="$(cd "$(dirname "$0")" && pwd)"' \
             'IFS=:' \
-            'for dir in ${PATH}; do' \
-            '  [ "${dir}" = "${self}" ] && continue' \
-            '  if [ -x "${dir}/cargo-cyclonedx" ]; then' \
-            '    exec "${dir}/cargo-cyclonedx" "$@"' \
+            'for bin_dir in ${PATH}; do' \
+            '  [ "${bin_dir}" = "${self}" ] && continue' \
+            '  if [ -x "${bin_dir}/cargo-cyclonedx" ]; then' \
+            '    status=0' \
+            '    "${bin_dir}/cargo-cyclonedx" "$@" || status=$?' \
+            '    block="${SBOM_SPY_BLOCK:-}"' \
+            '    if [ -n "${dir}" ] && [ -n "${block}" ]; then' \
+            '      rm -f "${dir}/${block}"' \
+            '      mkdir "${dir}/${block}"' \
+            '    fi' \
+            '    exit "${status}"' \
             '  fi' \
             'done' \
             'echo "cargo-cyclonedx not found behind the spy" >&2' \
@@ -3126,6 +3137,50 @@ jobs:
           filename_prefix: sbom-cv-generation-fails
           output_directory: cargo-version-out
 
+      # Generation succeeds, then a directory takes core/Cargo.toml's
+      # place, so the restore cannot write it back. The step must fail
+      # all the same, drop its document and keep the copies.
+      - name: "Running local action: Cargo version, restore fails"
+        id: restore-fails
+        continue-on-error: true
+        uses: $/
+        env:
+          SBOM_SPY_BLOCK: core/Cargo.toml
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: cargo-version/workspace
+          cargo_version: 1.2.3-rc.1+build.5
+          sbom_format: json
+          filename_prefix: sbom-cv-restore-fails
+          output_directory: cargo-version-out
+
+      # The original bytes must survive in a copy the action kept;
+      # then the checkout gets repaired for the runs and checks below
+      - name: "Check and repair after the failed restore"
+        id: restore-repair
+        shell: bash
+        run: |
+          # Check and repair after the failed restore
+          set -euo pipefail
+          member=workspace/core/Cargo.toml
+          kept="false"
+          git -C cargo-version show "HEAD:${member}" \
+            > "${RUNNER_TEMP}/original-core.toml"
+          while IFS= read -r copy; do
+            if cmp -s "${copy}" "${RUNNER_TEMP}/original-core.toml"; then
+              kept="true"
+            fi
+          done < <(find "${RUNNER_TEMP}" -path '*/sbom-cargo.*/stamp-copy-*' \
+            -type f)
+          echo "kept=${kept}" >> "${GITHUB_OUTPUT}"
+          if [ -d "cargo-version/${member}" ]; then
+            rmdir "cargo-version/${member}"
+          fi
+          git -C cargo-version checkout -- .
+          find "${RUNNER_TEMP}" -maxdepth 1 -name 'sbom-cargo.*' \
+            -exec rm -rf -- {} +
+
       # The skip comes before detection, and needs no refusal
       - name: "Running local action: Cargo version, untrusted"
         id: untrusted
@@ -3218,6 +3273,12 @@ jobs:
           GENERATION_FAILS: >-
             ${{ steps.generation-fails.outcome }}:${{
             steps.generation-fails.outputs.dependency_manager }}
+          RESTORE_FAILS: >-
+            ${{ steps.restore-fails.outcome }}:${{
+            steps.restore-fails.outputs.dependency_manager }}
+          # yamllint disable-line rule:line-length
+          RESTORE_FAILS_COUNT: ${{ steps.restore-fails.outputs.component_count }}
+          RESTORE_KEPT: ${{ steps.restore-repair.outputs.kept }}
           UNTRUSTED_OUTCOME: ${{ steps.untrusted.outcome }}
           UNTRUSTED_SKIPPED: ${{ steps.untrusted.outputs.skipped }}
           INVALID: >-
@@ -3331,12 +3392,20 @@ jobs:
           # Failed after validation reported Cargo: refused members,
           # and a cargo-cyclonedx failure after the rewrite
           for pair in "committed:${COMMITTED}" \
-            "generation-fails:${GENERATION_FAILS}"; do
+            "generation-fails:${GENERATION_FAILS}" \
+            "restore-fails:${RESTORE_FAILS}"; do
             run="${pair%%:*}"
             result="${pair#*:}"
             [ "${result}" = "failure:cargo" ] || \
               fail "${run}: expected a Cargo failure, got ${result}"
           done
+
+          # The failed restore alone failed that run: generation had
+          # counted the components, and the copy outlived the step
+          [ "${RESTORE_FAILS_COUNT}" = "3" ] || \
+            fail "restore-fails: generation did not succeed first"
+          [ "${RESTORE_KEPT}" = "true" ] || \
+            fail "restore-fails: no copy kept core/Cargo.toml's bytes"
 
           [ "${UNTRUSTED_OUTCOME}" = "success" ] || \
             fail "An untrusted checkout failed instead of skipping"
@@ -3352,8 +3421,8 @@ jobs:
             [ "${result}" = "failure:" ] || \
               fail "${run}: expected a validation failure, got ${result}"
           done
-          for run in committed generation-fails untrusted invalid syft \
-            python maven-declared maven-detected; do
+          for run in committed generation-fails restore-fails untrusted \
+            invalid syft python maven-declared maven-detected; do
             [ -z "$(find cargo-version-out -name "sbom-cv-${run}.*")" ] || \
               fail "${run}: a document survived a failed or skipped run"
           done
