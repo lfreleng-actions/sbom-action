@@ -54,14 +54,14 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -146,14 +146,14 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -268,14 +268,14 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -863,7 +863,7 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -877,7 +877,7 @@ jobs:
       # Temurin build metadata.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -1155,7 +1155,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -1167,7 +1167,7 @@ jobs:
       # the POM and JAR to plugins-artifacts.gradle.org.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -1419,7 +1419,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -1430,7 +1430,7 @@ jobs:
       # manifests from.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -1878,7 +1878,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -1886,7 +1886,7 @@ jobs:
       # static.crates.io, which cargo metadata reads semver from
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -2322,7 +2322,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -2330,7 +2330,7 @@ jobs:
       # the shared allow-list still serves the cargo-cyclonedx install
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -2848,7 +2848,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -2857,7 +2857,7 @@ jobs:
       # from for the dependencies fixture
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -3458,7 +3458,7 @@ jobs:
         fixture: [uv, pdm, poetry, pipenv, pip-tools, pip]
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -3466,7 +3466,7 @@ jobs:
       # files.pythonhosted.org, which every install here reads.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -3718,13 +3718,13 @@ jobs:
             cyclonedx_py: '4.0.0'
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -3778,7 +3778,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
@@ -3786,7 +3786,7 @@ jobs:
       # setup.py during the install on purpose.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -4553,14 +4553,14 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5 # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
         with:
           config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
