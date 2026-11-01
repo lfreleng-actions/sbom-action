@@ -54,9 +54,9 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -146,9 +146,9 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -268,9 +268,9 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
@@ -863,9 +863,9 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Block, like every other job here. Running a build tool that
       # resolves arbitrary plugins under unrestricted egress would make
@@ -1155,9 +1155,9 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Block, as everywhere else here. The shared allow-list carries
       # Maven Central, api.adoptium.net, services.gradle.org for the
@@ -1419,9 +1419,9 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Block, like every other job here: cargo runs a rustc wrapper
       # from the checkout, which one fixture below does on purpose.
@@ -1878,9 +1878,9 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # The shared allow-list carries index.crates.io and
       # static.crates.io, which cargo metadata reads semver from
@@ -2322,9 +2322,9 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Every Cargo call here runs offline, so none reaches crates.io;
       # the shared allow-list still serves the cargo-cyclonedx install
@@ -2848,9 +2848,9 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # The shared allow-list carries index.crates.io and
       # static.crates.io, which cargo metadata reads semver's manifest
@@ -3458,9 +3458,9 @@ jobs:
         fixture: [uv, pdm, poetry, pipenv, pip-tools, pip]
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # The shared allow-list carries pypi.org and
       # files.pythonhosted.org, which every install here reads.
@@ -3718,9 +3718,9 @@ jobs:
             cyclonedx_py: '4.0.0'
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
@@ -3778,9 +3778,9 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Block, like every other job here: one fixture below runs a
       # setup.py during the install on purpose.
@@ -4553,9 +4553,9 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22' # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
