@@ -3699,8 +3699,8 @@ jobs:
   # such as an uninstalled project whose optional dependency is a
   # direct URL. The helpers run beside cyclonedx-bom, which brings
   # packaging and cyclonedx-python-lib, so they are tested on every
-  # Python python_version accepts that is still supported, 3.10 to
-  # 3.15, at the default version, and on 3.10 at the 4.0.0 floor.
+  # Python python_version accepts, 3.11 to 3.15, at the default
+  # version, and on 3.11 at the 4.0.0 floor.
   test-python-helpers:
     # yamllint disable-line rule:line-length
     name: "Test: python backend helpers (${{ matrix.python }} ${{ matrix.cyclonedx_py || 'default' }})"
@@ -3711,10 +3711,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
+        python: ['3.11', '3.12', '3.13', '3.14', '3.15']
         cyclonedx_py: ['']
         include:
-          - python: '3.10'
+          - python: '3.11'
             cyclonedx_py: '4.0.0'
     steps:
       # yamllint disable-line rule:line-length
@@ -3764,8 +3764,7 @@ jobs:
           echo "Python $("${PYTHON_CMD}" --version), cyclonedx-bom ${version}"
           "${PYTHON_CMD}" -I -m venv "${RUNNER_TEMP}/helpers"
           "${RUNNER_TEMP}/helpers/bin/python" -I -m pip install --quiet \
-            --disable-pip-version-check "cyclonedx-bom==${version}" \
-            'tomli; python_version < "3.11"'
+            --disable-pip-version-check "cyclonedx-bom==${version}"
           "${RUNNER_TEMP}/helpers/bin/python" -E -s -m unittest discover \
             -s tests/python -t . -v
 
@@ -4752,13 +4751,13 @@ jobs:
         with:
           python_version: '3.12; id'
 
-      # End of life, and below what the package managers require
-      - name: "Running local action with a python version below 3.10"
+      # End of life, and the newest release below the floor
+      - name: "Running local action with a python version below 3.11"
         id: old-python-version
         continue-on-error: true
         uses: $/
         with:
-          python_version: '3.9'
+          python_version: '3.10'
 
       - name: "Running local action with invalid cyclonedx-py version"
         id: bad-cyclonedx-py-version

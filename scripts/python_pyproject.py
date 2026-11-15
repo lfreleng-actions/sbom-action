@@ -33,20 +33,13 @@ from __future__ import annotations
 
 import json
 import re
-import sys
+import tomllib
 from importlib.metadata import distributions
 from typing import cast
 
 # Ships with cyclonedx-bom, whose environment runs this script
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
-
-# Python 3.10, the oldest python_version accepts, lacks tomllib; the
-# action installs tomli alongside this script for it
-if sys.version_info >= (3, 11):  # noqa: UP036
-    import tomllib
-else:  # pragma: no cover
-    import tomli as tomllib  # pyright: ignore[reportUnreachable]
 
 Table = dict[str, object]
 
