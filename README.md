@@ -483,13 +483,10 @@ downloads it, a release new enough to lack wheels, so the install
 compiles dependencies from source until the job times out
 ([python-sbom-action#151](https://github.com/lfreleng-actions/python-sbom-action/issues/151)).
 A `python_version` the project rejects fails the run at the lock check,
-within seconds, with an error naming the input. It must be **3.10 or
-later**: every older
-release is end of life, and the current releases of pip, uv, PDM,
-Poetry and Pipenv all require 3.10. Validation refuses anything older.
-The action's own tests run on every release from 3.10 to 3.15. On 3.10,
-which lacks `tomllib`, the action installs `tomli` for its own
-`pyproject.toml` reader.
+within seconds, with an error naming the input. It must be **3.11 or
+later**: every older release is end of life. Validation refuses
+anything older. The action's own tests run on every release from 3.11
+to 3.15.
 
 ## Inputs
 
@@ -538,7 +535,7 @@ surfaces regardless of the backend in use.
 | cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                                                           |
 | cargo_working_directory   | False    | `''`      | Cargo: directory to run Cargo from, `path_prefix` or beneath it; empty runs it from `path_prefix`                           |
 | cargo_version             | False    | `''`      | Cargo: SemVer 2.0 release version to describe in place of every member's `0.0.0`; empty describes the checkout as committed |
-| python_version            | False    | `3.12`    | Python for the python backend's tools and environment; `3.10` or newer                                                      |
+| python_version            | False    | `3.12`    | Python for the python backend's tools and environment; `3.11` or newer                                                      |
 | cyclonedx_py_version      | False    | `7.5.0`   | `cyclonedx-bom` (`cyclonedx-py`) version for the python backend; `4.0.0` or newer                                           |
 
 <!-- markdownlint-enable MD013 -->

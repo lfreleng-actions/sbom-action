@@ -7,7 +7,7 @@
 [project]
 name = "sbom-fixture-uv-groups"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "iniconfig==2.1.0",
 ]

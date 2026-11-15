@@ -200,7 +200,7 @@ inputs:
   # Optional, python backend only
   python_version:
     # yamllint disable-line rule:line-length
-    description: "Python for the python backend's tools and environment; 3.10 or newer"
+    description: "Python for the python backend's tools and environment; 3.11 or newer"
     required: false
     default: "3.12"
   cyclonedx_py_version:
@@ -634,11 +634,10 @@ runs:
             echo "Expected a Python version such as 3.12 or 3.x"
             exit 1 ;;
         esac
-        # Python 3.10 is the floor: every older release is end of life,
-        # and the package managers this backend installs (pip, uv, PDM,
-        # Poetry, Pipenv) require 3.10 in their current releases. The
-        # minor version is compared as a number, so 3.10 passes and 3.9
-        # does not; '3' and '3.x' ask for the newest 3.x and pass too.
+        # Python 3.11 is the floor: every older release is end of life.
+        # The minor version is compared as a number, so 3.11 passes and
+        # 3.10 does not; '3' and '3.x' ask for the newest 3.x and pass
+        # too.
         python_supported="no"
         case "${INPUT_PYTHON_VERSION}" in
           3|3.x) python_supported="yes" ;;
@@ -648,16 +647,15 @@ runs:
             case "${python_minor}" in
               *[!0-9]*) ;;
               *)
-                if [ "${python_minor}" -ge 10 ]; then
+                if [ "${python_minor}" -ge 11 ]; then
                   python_supported="yes"
                 fi ;;
             esac ;;
         esac
         if [ "${python_supported}" != "yes" ]; then
           echo "Error: python_version is below the supported floor ❌"
-          echo "Minimum supported: 3.10"
-          echo "Earlier releases are end of life, and the package"
-          echo "managers this backend installs require 3.10"
+          echo "Minimum supported: 3.11"
+          echo "Earlier releases are end of life"
           exit 1
         fi
         case "${INPUT_CYCLONEDX_PY_VERSION}" in
@@ -3201,14 +3199,10 @@ runs:
               # would otherwise replace the module '-m' names, ahead of
               # the scrub. -I also ignores PYTHON* variables and the
               # user site directory.
-              #
-              # tomli backs the pyproject reader on Python 3.10, which
-              # lacks tomllib
               if ! "${PYTHON_CMD}" -I -m venv "${cdx}" || \
                 ! "${cdx}/bin/python" -I -m pip install --quiet \
                 --disable-pip-version-check \
-                "cyclonedx-bom==${CYCLONEDX_PY_VERSION}" \
-                'tomli; python_version < "3.11"'; then
+                "cyclonedx-bom==${CYCLONEDX_PY_VERSION}"; then
                 backend_failure="could not install cyclonedx-bom"
                 backend_failure+=" ${CYCLONEDX_PY_VERSION}"
                 return 1

@@ -5,10 +5,10 @@
 groups = ["default", "dev"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.1"
-content_hash = "sha256:02ac778f65752c018c03fa10e4fe4a52956858d1bc5f5d52d8b064b787a0e46b"
+content_hash = "sha256:0d94ad97c6f639e5f06573233817530a0c8dcdce1366001c2d8d9d9fb79fd82e"
 
 [[metadata.targets]]
-requires_python = ">=3.10"
+requires_python = ">=3.11"
 
 [[package]]
 name = "iniconfig"

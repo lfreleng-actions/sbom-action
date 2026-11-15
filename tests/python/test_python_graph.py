@@ -10,8 +10,8 @@ python -m unittest discover -s tests/python -t .
 from __future__ import annotations
 
 import io
-import sys
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -26,11 +26,6 @@ from scripts.python_graph import (
     resolve_graph,
 )
 from scripts.python_pyproject import inspect, toml_value
-
-if sys.version_info >= (3, 11):  # noqa: UP036
-    import tomllib
-else:  # pragma: no cover
-    import tomli as tomllib  # pyright: ignore[reportUnreachable]
 
 # The interpreter running the tests stands in for the scanned one
 ENVIRONMENT = {key: str(value) for key, value in default_environment().items()}
