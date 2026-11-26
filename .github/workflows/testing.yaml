@@ -61,7 +61,7 @@ jobs:
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -153,7 +153,7 @@ jobs:
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -275,7 +275,7 @@ jobs:
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -877,7 +877,7 @@ jobs:
       # Temurin build metadata.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -1167,7 +1167,7 @@ jobs:
       # the POM and JAR to plugins-artifacts.gradle.org.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -1430,7 +1430,7 @@ jobs:
       # manifests from.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -1886,7 +1886,7 @@ jobs:
       # static.crates.io, which cargo metadata reads semver from
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -2330,7 +2330,7 @@ jobs:
       # the shared allow-list still serves the cargo-cyclonedx install
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -2857,7 +2857,7 @@ jobs:
       # from for the dependencies fixture
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -3466,7 +3466,7 @@ jobs:
       # files.pythonhosted.org, which every install here reads.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -3724,7 +3724,7 @@ jobs:
 
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -3785,7 +3785,7 @@ jobs:
       # setup.py during the install on purpose.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -4559,7 +4559,7 @@ jobs:
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: 'block'
           allowed-endpoints: >
