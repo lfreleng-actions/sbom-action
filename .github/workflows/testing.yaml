@@ -379,7 +379,7 @@ jobs:
 
       - name: "Save images with docker-save-images-action"
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/docker-save-images-action@b0d9fa6318d0ff08779b0487749fc784fa073969 # v0.2.2
+        uses: lfreleng-actions/docker-save-images-action@bcf3df3bbce43b347b2a968934016683fe794f99 # v0.2.4
         with:
           # yamllint disable-line rule:line-length
           docker-artifacts-to-save: 'sbom-action-test/fixture:ci sbom-action-test-scratch:ci'
