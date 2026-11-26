@@ -1263,6 +1263,18 @@ that set `maven.deploy.skip`, which is consistent with describing the
 deployed product but can surprise anyone counting components on a
 project with non-deployed test-harness modules.
 
+The same property skips the whole `makeAggregateBom` goal when the
+reactor **root** sets `maven.deploy.skip`, as a pure aggregator POM
+often does, and the plugin then exits 0 having written nothing. The
+action recognises that outcome, whatever Maven's log level, logs a
+warning and retries once with `-Dcyclonedx.skipNotDeployed=false`, so
+the document then also covers any modules that skip deploy. The action
+does not retry, and fails with a reason naming the fix, in two cases:
+`maven_args` sets `cyclonedx.skipNotDeployed` itself, a choice the
+action respects; or `maven_args` names goals or phases, which a retry
+would run a second time. In the latter case, add
+`-Dcyclonedx.skipNotDeployed=false` to `maven_args`.
+
 **For Cargo, `include_dev` cannot include dev-dependencies.**
 `cargo-cyclonedx` never records them, as neither component nor edge,
 and offers no flag to include them (measured on 0.5.9). A Cargo SBOM
