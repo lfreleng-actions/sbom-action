@@ -4911,6 +4911,107 @@ jobs:
           filename_prefix: sbom-pomskip-soft
           fail_on_error: 'false'
 
+      # A pure aggregator root commonly sets maven.deploy.skip. The
+      # plugin's skipNotDeployed default then skips the whole aggregate
+      # goal, not just that module, and exits 0 having written nothing.
+      # The action must retry with the property off, unless the caller
+      # set it, when it must fail with a reason naming it.
+      - name: "Create a reactor whose root skips deploy"
+        shell: bash
+        run: |
+          # Create a reactor whose root skips deploy
+          mkdir -p deploy-skip-root/app
+          cat > deploy-skip-root/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.lfreleng.test</groupId>
+            <artifactId>deploy-skip-root</artifactId>
+            <version>1.0.0</version>
+            <packaging>pom</packaging>
+            <properties>
+              <maven.deploy.skip>true</maven.deploy.skip>
+            </properties>
+            <modules>
+              <module>app</module>
+            </modules>
+          </project>
+          POMEOF
+          cat > deploy-skip-root/app/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.lfreleng.test</groupId>
+            <artifactId>deploy-skip-app</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+          </project>
+          POMEOF
+
+      - name: "Root skips deploy (retried)"
+        id: deploy-skip-root
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: deploy-skip-root
+          sbom_format: json
+          filename_prefix: sbom-deployskip
+
+      - name: "Root skips deploy, caller keeps skipNotDeployed"
+        id: deploy-skip-caller
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: deploy-skip-root
+          sbom_format: json
+          filename_prefix: sbom-deployskip-caller
+          maven_args: '-Dcyclonedx.skipNotDeployed=true'
+
+      # -q hides the plugin's INFO line, so recognising the case must
+      # not depend on it
+      - name: "Root skips deploy, quiet Maven (retried)"
+        id: deploy-skip-quiet
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: deploy-skip-root
+          sbom_format: json
+          filename_prefix: sbom-deployskip-quiet
+          maven_args: '-q'
+
+      - name: "Root skips deploy, quiet Maven, caller keeps the property"
+        id: deploy-skip-quiet-caller
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: deploy-skip-root
+          sbom_format: json
+          filename_prefix: sbom-deployskip-quiet-caller
+          maven_args: '-q -D cyclonedx.skipNotDeployed'
+
+      # A goal in maven_args has side effects (clean deletes target/;
+      # deploy publishes), so the action must fail rather than run it
+      # a second time in a retry
+      - name: "Root skips deploy, maven_args names a goal"
+        id: deploy-skip-goal
+        continue-on-error: true
+        uses: $/
+        with:
+          backend: cyclonedx
+          untrusted_checkout: 'false'
+          path_prefix: deploy-skip-root
+          sbom_format: json
+          filename_prefix: sbom-deployskip-goal
+          maven_args: 'clean'
+
       # The destinations derive from filename_prefix and
       # output_directory, both caller-controlled and both defaulting
       # into the workspace. Clearing them must never unlink a project
@@ -5229,6 +5330,19 @@ jobs:
           POM_SKIP_SOFT_OUTCOME: ${{ steps.pom-skip-soft.outcome }}
           # yamllint disable-line rule:line-length
           POM_SKIP_SOFT_COUNT: ${{ steps.pom-skip-soft.outputs.component_count }}
+          DEPLOY_SKIP_OUTCOME: ${{ steps.deploy-skip-root.outcome }}
+          # yamllint disable-line rule:line-length
+          DEPLOY_SKIP_JSON: ${{ steps.deploy-skip-root.outputs.sbom_json_path }}
+          # yamllint disable-line rule:line-length
+          DEPLOY_SKIP_CALLER_OUTCOME: ${{ steps.deploy-skip-caller.outcome }}
+          # yamllint disable-line rule:line-length
+          DEPLOY_SKIP_QUIET_OUTCOME: ${{ steps.deploy-skip-quiet.outcome }}
+          # yamllint disable-line rule:line-length
+          DEPLOY_SKIP_QUIET_JSON: ${{ steps.deploy-skip-quiet.outputs.sbom_json_path }}
+          # yamllint disable-line rule:line-length
+          DEPLOY_SKIP_QUIET_CALLER_OUTCOME: ${{ steps.deploy-skip-quiet-caller.outcome }}
+          # yamllint disable-line rule:line-length
+          DEPLOY_SKIP_GOAL_OUTCOME: ${{ steps.deploy-skip-goal.outcome }}
           COLLIDE_OUTCOME: ${{ steps.collide.outcome }}
           COLLIDE_DECOY_OUTCOME: ${{ steps.collide-decoy.outcome }}
           # yamllint disable-line rule:line-length
@@ -5282,6 +5396,9 @@ jobs:
             "collide-symlink:${COLLIDE_SYMLINK_OUTCOME}" \
             "maven-args-define:${BAD_MAVEN_ARGS_OUTCOME}" \
             "maven-args-file:${BAD_MAVEN_FILE_OUTCOME}" \
+            "deploy-skip-caller:${DEPLOY_SKIP_CALLER_OUTCOME}" \
+            "deploy-skip-quiet-caller:${DEPLOY_SKIP_QUIET_CALLER_OUTCOME}" \
+            "deploy-skip-goal:${DEPLOY_SKIP_GOAL_OUTCOME}" \
             "hard-fail:${HARD_FAIL_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
@@ -5374,6 +5491,25 @@ jobs:
           if [ -n "$(find . -maxdepth 1 -name 'sbom-pomskip-*' \
             2>/dev/null)" ]; then
             echo "POM-disabled run left a document behind ❌"
+            errors=1
+          fi
+
+          # A root that skips deploy must still yield a document
+          # covering its modules, through the action's retry
+          if [ "${DEPLOY_SKIP_OUTCOME}" != "success" ]; then
+            echo "Root skipping deploy produced no SBOM ❌"
+            errors=1
+          elif ! jq -e '[.components[]?.name] | index("deploy-skip-app")' \
+            "${DEPLOY_SKIP_JSON}" > /dev/null; then
+            echo "Root-skip SBOM is missing the app module ❌"
+            errors=1
+          fi
+          if [ "${DEPLOY_SKIP_QUIET_OUTCOME}" != "success" ]; then
+            echo "Root skipping deploy under -q produced no SBOM ❌"
+            errors=1
+          elif ! jq -e '[.components[]?.name] | index("deploy-skip-app")' \
+            "${DEPLOY_SKIP_QUIET_JSON}" > /dev/null; then
+            echo "Quiet root-skip SBOM is missing the app module ❌"
             errors=1
           fi
 

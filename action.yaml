@@ -2230,6 +2230,8 @@ runs:
                 # The explicit rejection below turns a silently ignored
                 # override into a clear error; the ordering is what makes
                 # it safe regardless.
+                caller_skip_not_deployed=""
+                caller_goals=""
                 if [ -n "${INPUT_MAVEN_ARGS}" ]; then
                   set -f
                   # shellcheck disable=SC2086
@@ -2270,6 +2272,14 @@ runs:
                       esac
                     fi
                     [ -n "${candidate}" ] || continue
+                    # Maven reads a bare -Dname as name=true
+                    if [ "${candidate%%=*}" = "cyclonedx.skipNotDeployed" ]
+                    then
+                      caller_skip_not_deployed="true"
+                      if [ "${candidate}" != "${candidate#*=}" ]; then
+                        caller_skip_not_deployed="${candidate#*=}"
+                      fi
+                    fi
                     case "${candidate%%=*}" in
                       outputFormat|outputName|outputDirectory|\
                       schemaVersion|includeTestScope|\
@@ -2285,6 +2295,33 @@ runs:
                         echo "cyclonedx.skip and cyclonedx.skipAttach are" \
                           "reserved: skipping would defeat the action."
                         exit 1 ;;
+                    esac
+                  done
+                  # Note whether maven_args names goals or phases, so the
+                  # root-skip retry below never runs them a second time:
+                  # 'deploy' would publish twice. A word that no option
+                  # listed here consumes counts as a goal, so an option
+                  # missing from the list errs towards not retrying.
+                  set -f
+                  # shellcheck disable=SC2206
+                  caller_args=(${INPUT_MAVEN_ARGS})
+                  set +f
+                  expect_value="no"
+                  for arg in "${caller_args[@]}"; do
+                    if [ "${expect_value}" = "yes" ]; then
+                      expect_value="no"
+                      continue
+                    fi
+                    case "${arg}" in
+                      -D|--define|-P|--activate-profiles|-pl|--projects|\
+                      -rf|--resume-from|-s|--settings|-gs|\
+                      --global-settings|-t|--toolchains|-gt|\
+                      --global-toolchains|-T|--threads|-l|--log-file|\
+                      -b|--builder|-emp|--encrypt-master-password|\
+                      -ep|--encrypt-password|--color)
+                        expect_value="yes" ;;
+                      -*) ;;
+                      *) caller_goals="true" ;;
                     esac
                   done
                 fi
@@ -2321,6 +2358,57 @@ runs:
                 (cd "${PROJECT_DIR}" && mvn "$@")
                 backend_exit=$?
                 set -e
+
+                # skipNotDeployed (default true) skips the whole goal when
+                # the reactor ROOT skips deploy, which a pure aggregator
+                # POM commonly does, and not just the non-deployed modules
+                # the README describes. One property governs both, so the
+                # action retries once with it off, which also brings any
+                # non-deployed modules into the document.
+                #
+                # The plugin exits 0 having written nothing. The case is
+                # recognised by that outcome rather than by the plugin's
+                # INFO line, which -q in maven_args or .mvn/maven.config
+                # suppresses; the destinations were cleared above, so a
+                # missing document is this run's own. A caller that set
+                # the property through maven_args chose it, and goals or
+                # phases in maven_args must not run twice, so either way
+                # the step fails with a reason naming the fix instead.
+                if [ "${backend_exit}" = "0" ] && [ ! -f "${json_path}" ]
+                then
+                  if [ -n "${caller_skip_not_deployed}" ]; then
+                    if [ "${caller_skip_not_deployed}" != "false" ]; then
+                      backend_exit=1
+                      backend_failure="the plugin wrote no document;"
+                      backend_failure+=" maven_args sets"
+                      backend_failure+=" cyclonedx.skipNotDeployed, which"
+                      backend_failure+=" skips the aggregate goal when the"
+                      backend_failure+=" reactor root sets"
+                      backend_failure+=" maven.deploy.skip; drop it from"
+                      backend_failure+=" maven_args or set it to false"
+                    fi
+                  elif [ -n "${caller_goals}" ]; then
+                    backend_exit=1
+                    backend_failure="the plugin wrote no document, as it"
+                    backend_failure+=" does when the reactor root sets"
+                    backend_failure+=" maven.deploy.skip; maven_args names"
+                    backend_failure+=" goals or phases, which a retry"
+                    backend_failure+=" would run twice, so add"
+                    backend_failure+=" -Dcyclonedx.skipNotDeployed=false"
+                    backend_failure+=" to maven_args"
+                  else
+                    echo "::warning::cyclonedx-maven-plugin wrote no" \
+                      "document, as it does when the reactor root skips" \
+                      "deploy; retrying with" \
+                      "-Dcyclonedx.skipNotDeployed=false, which also" \
+                      "includes modules that skip deploy"
+                    set +e
+                    (cd "${PROJECT_DIR}" && mvn "$@" \
+                      -Dcyclonedx.skipNotDeployed=false)
+                    backend_exit=$?
+                    set -e
+                  fi
+                fi
 
                 # Guarded on the file existing: a zero exit does not imply
                 # output was written, and an unguarded mv would abort the
