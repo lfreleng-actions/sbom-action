@@ -72,7 +72,8 @@ inputs:
     required: false
     default: "."
   mode:
-    description: "What to describe: 'directory' (path_prefix) or 'image'"
+    # yamllint disable-line rule:line-length
+    description: "What to describe: 'directory' (path_prefix), 'image' or 'merge' (the Maven module BOMs a build wrote under path_prefix)"
     required: false
     default: "directory"
   image_archive_directory:
@@ -81,13 +82,15 @@ inputs:
     required: false
     default: ""
   sbom_format:
-    description: "SBOM output format: 'json', 'xml', or 'both'"
+    # yamllint disable-line rule:line-length
+    description: "SBOM output format: 'auto', 'json', 'xml', or 'both'; 'auto' is 'json' in merge mode and 'both' otherwise"
     required: false
-    default: "both"
+    default: "auto"
   sbom_spec_version:
-    description: "CycloneDX specification version to use"
+    # yamllint disable-line rule:line-length
+    description: "CycloneDX specification version to use; 'auto' is the module BOMs' own in merge mode and '1.5' otherwise"
     required: false
-    default: "1.5"
+    default: "auto"
   filename_prefix:
     description: "Base filename for SBOM output (without extension)"
     required: false
@@ -197,10 +200,17 @@ inputs:
     required: false
     default: ""
 
+  # Optional, merge mode only
+  merge_root_name:
+    # yamllint disable-line rule:line-length
+    description: "Merge mode: name of the merged document's root, reactor:<name>"
+    required: false
+    default: ${{ github.repository }}
+
   # Optional, python backend only
   python_version:
     # yamllint disable-line rule:line-length
-    description: "Python for the python backend's tools and environment; 3.11 or newer"
+    description: "Python for the python backend's tools and environment, and for merge mode; 3.11 or newer"
     required: false
     default: "3.12"
   cyclonedx_py_version:
@@ -250,6 +260,16 @@ outputs:
     # yamllint disable-line rule:line-length
     description: "Image mode: newline-separated files written, manifest included"
     value: ${{ steps.generate.outputs.artifact_paths }}
+  merge_bom_count:
+    description: "Merge mode: number of module BOMs merged"
+    value: ${{ steps.generate.outputs.merge_bom_count }}
+  merge_module_count:
+    description: "Merge mode: number of modules in the merged document"
+    value: ${{ steps.generate.outputs.merge_module_count }}
+  merge_missing_bom_count:
+    # yamllint disable-line rule:line-length
+    description: "Merge mode: number of pom.xml directories with no target/bom.json"
+    value: ${{ steps.generate.outputs.merge_missing_bom_count }}
 
 runs:
   using: "composite"
@@ -269,6 +289,7 @@ runs:
         INPUT_OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
         INPUT_INCLUDE_DEV: ${{ inputs.include_dev }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        INPUT_MAVEN_ARGS: ${{ inputs.maven_args }}
         INPUT_JAVA_VERSION: ${{ inputs.java_version }}
         INPUT_JAVA_DISTRIBUTION: ${{ inputs.java_distribution }}
         INPUT_MAVEN_PLUGIN_VERSION: ${{ inputs.maven_plugin_version }}
@@ -346,9 +367,9 @@ runs:
             exit 1 ;;
         esac
         case "${INPUT_MODE}" in
-          directory|image) ;;
+          directory|image|merge) ;;
           *)
-            echo "Error: mode must be 'directory' or 'image' ❌"
+            echo "Error: mode must be 'directory', 'image' or 'merge' ❌"
             exit 1 ;;
         esac
         # Image mode reads docker archives, which only syft can do: the
@@ -370,9 +391,10 @@ runs:
           exit 1
         fi
         case "${INPUT_SBOM_FORMAT}" in
-          json|xml|both) ;;
+          auto|json|xml|both) ;;
           *)
-            echo "Error: sbom_format must be 'json', 'xml' or 'both' ❌"
+            echo "Error: sbom_format must be 'auto', 'json', 'xml' or" \
+              "'both' ❌"
             exit 1 ;;
         esac
         case "${INPUT_INCLUDE_DEV}" in
@@ -397,11 +419,72 @@ runs:
         # A case glob validates the entire string, including embedded
         # newlines; grep would only validate per line
         case "${INPUT_SBOM_SPEC_VERSION}" in
+          auto) ;;
           *[!0-9.]*|''|.*|*.|*..*)
             echo "Error: invalid sbom_spec_version ❌"
-            echo "Expected a CycloneDX version such as 1.5 or 1.6"
+            echo "Expected 'auto' or a CycloneDX version such as 1.5"
             exit 1 ;;
         esac
+        # Merge mode reads the module BOMs a Maven build already wrote,
+        # which cyclonedx-maven-plugin makes, so it belongs to that
+        # backend and build tool. It runs no build, so the inputs that
+        # shape one cannot apply and are refused rather than ignored:
+        # the project's own makeBom configuration decides test scope.
+        # It converts nothing either, so it writes JSON alone.
+        if [ "${INPUT_MODE}" = "merge" ]; then
+          if [ "${INPUT_BACKEND}" != "cyclonedx" ]; then
+            echo "Error: mode 'merge' requires backend 'cyclonedx' ❌"
+            exit 1
+          fi
+          case "${INPUT_DEPENDENCY_MANAGER}" in
+            auto|maven) ;;
+            *)
+              echo "Error: mode 'merge' requires dependency_manager" \
+                "'maven' or 'auto' ❌"
+              echo "Merge mode merges the module BOMs of a Maven build"
+              exit 1 ;;
+          esac
+          if [ -n "${INPUT_MAVEN_ARGS}" ]; then
+            echo "Error: maven_args does not apply in mode 'merge' ❌"
+            echo "Merge mode runs no Maven; it reads the BOMs the"
+            echo "build already wrote"
+            exit 1
+          fi
+          if [ "${INPUT_INCLUDE_DEV}" = "true" ]; then
+            echo "Error: include_dev does not apply in mode 'merge' ❌"
+            echo "The project's own makeBom configuration decides"
+            echo "whether its module BOMs include test scope"
+            exit 1
+          fi
+          case "${INPUT_SBOM_FORMAT}" in
+            auto|json) ;;
+            *)
+              echo "Error: mode 'merge' writes sbom_format 'json' only ❌"
+              echo "Set sbom_format to 'json' or 'auto'"
+              exit 1 ;;
+          esac
+        fi
+        # 'auto' resolves here, once; every later reader takes the
+        # resolved value from this step's outputs. Outside merge mode it
+        # resolves to the defaults these inputs carried before 'auto'
+        # existed. In merge mode the format is JSON and the version
+        # stays 'auto' until generate reads the module BOMs, since the
+        # project's build decided it.
+        sbom_format="${INPUT_SBOM_FORMAT}"
+        if [ "${sbom_format}" = "auto" ]; then
+          if [ "${INPUT_MODE}" = "merge" ]; then
+            sbom_format="json"
+          else
+            sbom_format="both"
+          fi
+        fi
+        sbom_spec_version="${INPUT_SBOM_SPEC_VERSION}"
+        if [ "${sbom_spec_version}" = "auto" ] && \
+          [ "${INPUT_MODE}" != "merge" ]; then
+          sbom_spec_version="1.5"
+        fi
+        echo "sbom_format=${sbom_format}" >> "$GITHUB_OUTPUT"
+        echo "sbom_spec_version=${sbom_spec_version}" >> "$GITHUB_OUTPUT"
         # Restrict the filename prefix to a safe character set so it
         # cannot alter paths or inject into downstream commands
         case "${INPUT_FILENAME_PREFIX}" in
@@ -869,10 +952,15 @@ runs:
         # whether or not generation happens - otherwise a checked-in or
         # previously generated sbom-cyclonedx.* would survive the skip
         # and be published by the caller's artifact glob.
+        #
+        # Merge mode executes nothing from the checkout: it reads JSON
+        # files and asks git, with core.fsmonitor forced off, whether
+        # the repository tracks them. It runs whatever the checkout.
         skipped="false"
         case "${INPUT_BACKEND}" in
           cyclonedx|python)
-            if [ "${untrusted}" = "true" ]; then
+            if [ "${untrusted}" = "true" ] && \
+              [ "${INPUT_MODE}" != "merge" ]; then
               skipped="true"
             fi ;;
         esac
@@ -905,7 +993,29 @@ runs:
         # inspection of the tree. build-metadata-action reports exactly
         # this as build_tool, so a lane can pass it straight through.
         dependency_manager=""
-        if [ "${INPUT_BACKEND}" = "cyclonedx" ] && \
+        if [ "${INPUT_MODE}" = "merge" ]; then
+          # Validation above admits only 'maven' and 'auto' here. The
+          # reactor root need not sit at path_prefix: a caller wanting
+          # modules a reactor names beside its root passes '.', so no
+          # pom.xml is required there. 'auto' still refuses a project
+          # that detection would resolve to another build tool.
+          if [ "${INPUT_DEPENDENCY_MANAGER}" = "auto" ] && \
+            [ ! -f "${resolved}/pom.xml" ]; then
+            for marker in build.gradle build.gradle.kts \
+              settings.gradle settings.gradle.kts Cargo.toml; do
+              if [ -f "${resolved}/${marker}" ]; then
+                echo "Error: mode 'merge' found ${marker}, not a Maven" \
+                  "project ❌"
+                echo "Merge mode merges the module BOMs of a Maven"
+                echo "build; set dependency_manager to 'maven' if this"
+                echo "project builds with Maven all the same"
+                exit 1
+              fi
+            done
+          fi
+          dependency_manager="maven"
+          echo "Merge mode: build tool ${dependency_manager}"
+        elif [ "${INPUT_BACKEND}" = "cyclonedx" ] && \
           [ "${skipped}" != "true" ]; then
           if [ "${INPUT_DEPENDENCY_MANAGER}" != "auto" ]; then
             dependency_manager="${INPUT_DEPENDENCY_MANAGER}"
@@ -973,7 +1083,7 @@ runs:
               fi
               # cargo-cyclonedx exits 2 on any other version, before
               # writing anything; saying so here names the input.
-              case "${INPUT_SBOM_SPEC_VERSION}" in
+              case "${sbom_spec_version}" in
                 1.3|1.4|1.5) ;;
                 *)
                   echo "Error: sbom_spec_version unsupported for Cargo ❌"
@@ -1082,7 +1192,7 @@ runs:
         cargo_tools=""
         if [ "${dependency_manager}" = "cargo" ]; then
           cargo_tools="cargo-cyclonedx@${INPUT_CARGO_CYCLONEDX_VERSION}"
-          if [ "${INPUT_SBOM_FORMAT}" != "json" ]; then
+          if [ "${sbom_format}" != "json" ]; then
             cargo_tools="${cargo_tools},cyclonedx@${INPUT_CYCLONEDX_CLI_VERSION}"
           fi
         fi
@@ -1181,7 +1291,7 @@ runs:
     # default, so nothing is lost by declining the overwrite.
     - name: "Set up JDK"
       # yamllint disable-line rule:line-length
-      if: ${{ inputs.backend == 'cyclonedx' && steps.validate.outputs.skipped != 'true' && steps.validate.outputs.dependency_manager != 'cargo' }}
+      if: ${{ inputs.backend == 'cyclonedx' && inputs.mode != 'merge' && steps.validate.outputs.skipped != 'true' && steps.validate.outputs.dependency_manager != 'cargo' }}
       # yamllint disable-line rule:line-length
       uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
       with:
@@ -1205,13 +1315,14 @@ runs:
         fallback: none
 
     # The python backend creates its environments from this
-    # interpreter. update-environment is off so the caller's job keeps
-    # whatever Python it had: the action reads the interpreter from the
+    # interpreter, and merge mode runs its merge script on it.
+    # update-environment is off so the caller's job keeps whatever
+    # Python it had: the action reads the interpreter from the
     # python-path output instead of PATH, and installs nothing into it.
     - name: "Set up Python"
       id: python
       # yamllint disable-line rule:line-length
-      if: ${{ inputs.backend == 'python' && steps.validate.outputs.skipped != 'true' }}
+      if: ${{ (inputs.backend == 'python' || inputs.mode == 'merge') && steps.validate.outputs.skipped != 'true' }}
       # yamllint disable-line rule:line-length
       uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
       with:
@@ -1236,8 +1347,9 @@ runs:
         PROJECT_DIR: ${{ inputs.path_prefix }}
         MODE: ${{ inputs.mode }}
         IMAGE_ARCHIVE_DIRECTORY: ${{ inputs.image_archive_directory }}
-        SBOM_FORMAT: ${{ inputs.sbom_format }}
-        SPEC_VERSION: ${{ inputs.sbom_spec_version }}
+        SBOM_FORMAT: ${{ steps.validate.outputs.sbom_format }}
+        # 'auto' in merge mode until the module BOMs settle it
+        SPEC_VERSION: ${{ steps.validate.outputs.sbom_spec_version }}
         FILENAME_PREFIX: ${{ inputs.filename_prefix }}
         OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
         INCLUDE_DEV: ${{ inputs.include_dev }}
@@ -1281,6 +1393,7 @@ runs:
         CARGO_VERSION: ${{ inputs.cargo_version }}
         PYTHON_CMD: ${{ steps.python.outputs.python-path }}
         PYTHON_VERSION: ${{ inputs.python_version }}
+        MERGE_ROOT_NAME: ${{ inputs.merge_root_name }}
         CYCLONEDX_PY_VERSION: ${{ inputs.cyclonedx_py_version }}
         # Maps the include_dev input onto syft's JavaScript cataloger;
         # further per-ecosystem scoping options join here as syft
@@ -1372,6 +1485,21 @@ runs:
               echo "line breaks or any of: * ? [ ] \\"
               exit 1 ;;
           esac
+        fi
+        # Merge mode reads <module>/target/bom.json, so a destination
+        # there would have the clearing below delete one of its inputs
+        # before the merge looks for them.
+        if [ "${MODE}" = "merge" ] && [ "${FILENAME_PREFIX}" = "bom" ] && \
+          [ "${OUTPUT_DIR##*/}" = "target" ] && \
+          { [ -e "${OUTPUT_DIR%/*}/pom.xml" ] || \
+            [ -L "${OUTPUT_DIR%/*}/pom.xml" ]; }; then
+          echo "Error: merge mode would overwrite a module BOM ❌"
+          printf 'Path: %s\n' \
+            "$(printf '%s' "${OUTPUT_DIR}/bom.json" | tr -d '\r\n')"
+          echo "output_directory and filename_prefix name a module's"
+          echo "target/bom.json, which merge mode reads. Choose another"
+          echo "filename_prefix or output_directory."
+          exit 1
         fi
         mkdir -p -- "${OUTPUT_DIR}"
 
@@ -2149,7 +2277,51 @@ runs:
           scrubbed_in "${PROJECT_DIR}" "$@"
         }
 
-        case "${BACKEND}" in
+        # Merge mode takes its own branch: it drives no backend tool,
+        # and only reads the module BOMs a Maven build wrote.
+        dispatch="${BACKEND}"
+        if [ "${MODE}" = "merge" ]; then
+          dispatch="merge"
+        fi
+        case "${dispatch}" in
+          merge)
+            # Run on setup-python's interpreter rather than whichever
+            # python3 the caller's PATH names, as a module from the
+            # action's own directory, the way the python backend runs
+            # its helpers: -E and -s keep PYTHON* variables and user
+            # site-packages out, so nothing in the workspace can shadow
+            # the script's imports. Scrubbed as the backends are; git
+            # runs inside the checkout through -C. The script prints its
+            # own ::error:: on failure.
+            merge_report=""
+            if [ -z "${PYTHON_CMD}" ] || [ ! -x "${PYTHON_CMD}" ]; then
+              backend_failure="setup-python provided no interpreter"
+              backend_exit=1
+            else
+              scratch_dir="$(mktemp -d "${RUNNER_TEMP}/sbom.XXXXXX")"
+              merge_report="${scratch_dir}/merge-report.json"
+              set +e
+              scrubbed_in "${GITHUB_ACTION_PATH}" "${PYTHON_CMD}" -E -s \
+                -m scripts.maven_merge \
+                --top "${PROJECT_DIR}" \
+                --root-name "${MERGE_ROOT_NAME}" \
+                --spec-version "${SPEC_VERSION}" \
+                --output "${json_path}" \
+                --report "${merge_report}"
+              backend_exit=$?
+              set -e
+              if [ "${backend_exit}" != "0" ]; then
+                backend_failure="the module BOMs could not be merged"
+              # The version the module BOMs carry, which the merge has
+              # checked against an explicit sbom_spec_version, becomes
+              # the one verify_json_document holds the document to.
+              elif ! SPEC_VERSION="$(jq -r '.spec_version' \
+                "${merge_report}")"; then
+                backend_failure="the merge wrote no readable report"
+                backend_exit=1
+              fi
+            fi
+            ;;
           syft)
             set -- -o "cyclonedx-json@${SPEC_VERSION}=${json_path}"
             if [ "${SBOM_FORMAT}" = "xml" ] || \
@@ -3703,6 +3875,28 @@ runs:
         fi
         echo "component_count=${component_count}" >> "$GITHUB_OUTPUT"
         echo "skipped=false" >> "$GITHUB_OUTPUT"
+        merge_line=""
+        if [ "${MODE}" = "merge" ]; then
+          if ! merge_counts="$(jq -r '[.bom_count, .module_count,
+            .other_count, .skipped_count, .missing_count]
+            | map(tostring) | join(" ")' "${merge_report}")"; then
+            echo "::error::the merge report is unreadable ❌"
+            rm -f -- "${json_path}"
+            exit 1
+          fi
+          read -r merge_boms merge_modules merge_others merge_skipped \
+            merge_missing <<< "${merge_counts}"
+          {
+            echo "merge_bom_count=${merge_boms}"
+            echo "merge_module_count=${merge_modules}"
+            echo "merge_missing_bom_count=${merge_missing}"
+          } >> "$GITHUB_OUTPUT"
+          merge_line="${merge_boms} module BOMs merged into"
+          merge_line+=" ${merge_modules} modules and ${merge_others} other"
+          merge_line+=" components; ${merge_skipped} tracked or linked BOMs"
+          merge_line+=" skipped;"
+          merge_line+=" ${merge_missing} pom.xml directories wrote no BOM"
+        fi
 
         echo "SBOM generation complete: ${component_count} components ✅"
         {
@@ -3721,6 +3915,10 @@ runs:
             [ -n "${CARGO_VERSION}" ]; then
             echo "**Cargo Version:** \`${CARGO_VERSION}\` in place of" \
               "\`0.0.0\`"
+          fi
+          if [ -n "${merge_line}" ]; then
+            echo "**Mode:** merge"
+            echo "**Merged:** ${merge_line}"
           fi
           echo "**Format:** ${SBOM_FORMAT}"
           echo "**Specification Version:** ${SPEC_VERSION}"

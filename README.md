@@ -249,7 +249,9 @@ backends are **skipped**. The step succeeds, `skipped` reports `true`,
 and the action writes no document — clearing both destination paths
 first, so a committed or leftover document cannot survive the skip for
 a caller's artifact glob to collect. This does not affect the `syft`
-backend, which executes nothing from the project.
+backend, which executes nothing from the project, nor
+[merge mode](#maven-module-boms-merge-mode), which reads the module
+BOMs an earlier build step wrote and runs nothing from the checkout.
 
 > One qualification: a guard protects the clearing. Where a
 > destination holds something the action cannot identify as a
@@ -492,19 +494,20 @@ to 3.15.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                    | Required | Default          | Description                                                                              |
-| ----------------------- | -------- | ---------------- | ---------------------------------------------------------------------------------------- |
-| backend                 | False    | `syft`           | SBOM generation backend: `syft`, `cyclonedx` or `python`                                 |
-| mode                    | False    | `directory`      | What to describe: `directory` (`path_prefix`) or `image`                                 |
-| path_prefix             | False    | `.`              | Project directory; must resolve within the workspace                                     |
-| image_archive_directory | False    | `''`             | Image mode: directory of docker archives, one image per `*.tar` file                     |
-| sbom_format             | False    | `both`           | SBOM output format: `json`, `xml`, or `both`                                             |
-| sbom_spec_version       | False    | `1.5`            | CycloneDX specification version to use                                                   |
-| filename_prefix         | False    | `sbom-cyclonedx` | Base filename for SBOM output (without extension)                                        |
-| output_directory        | False    | `.`              | SBOM report directory, within workspace or runner temp                                   |
-| include_dev             | False    | `false`          | Include development dependencies in SBOM; see [scoping](#development-dependency-scoping) |
-| fail_on_error           | False    | `true`           | Fail the action if SBOM generation encounters errors                                     |
-| syft_version            | False    | `''`             | Syft version to download (defaults to the installer's pinned version)                    |
+| Name                    | Required | Default             | Description                                                                                                        |
+| ----------------------- | -------- | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| backend                 | False    | `syft`              | SBOM generation backend: `syft`, `cyclonedx` or `python`                                                           |
+| mode                    | False    | `directory`         | What to describe: `directory` (`path_prefix`), `image` or `merge`; see [merge mode](#maven-module-boms-merge-mode) |
+| path_prefix             | False    | `.`                 | Project directory; must resolve within the workspace                                                               |
+| image_archive_directory | False    | `''`                | Image mode: directory of docker archives, one image per `*.tar` file                                               |
+| sbom_format             | False    | `auto`              | SBOM output format: `auto`, `json`, `xml`, or `both`; `auto` is `json` in merge mode and `both` otherwise          |
+| sbom_spec_version       | False    | `auto`              | CycloneDX specification version to use; `auto` is the module BOMs' own in merge mode and `1.5` otherwise           |
+| filename_prefix         | False    | `sbom-cyclonedx`    | Base filename for SBOM output (without extension)                                                                  |
+| output_directory        | False    | `.`                 | SBOM report directory, within workspace or runner temp                                                             |
+| include_dev             | False    | `false`             | Include development dependencies in SBOM; see [scoping](#development-dependency-scoping)                           |
+| fail_on_error           | False    | `true`              | Fail the action if SBOM generation encounters errors                                                               |
+| syft_version            | False    | `''`                | Syft version to download (defaults to the installer's pinned version)                                              |
+| merge_root_name         | False    | `github.repository` | Merge mode: name of the merged document's root, `reactor:<name>`                                                   |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -535,7 +538,7 @@ surfaces regardless of the backend in use.
 | cargo_no_default_features | False    | `false`   | Cargo: do not activate default features (`--no-default-features`)                                                           |
 | cargo_working_directory   | False    | `''`      | Cargo: directory to run Cargo from, `path_prefix` or beneath it; empty runs it from `path_prefix`                           |
 | cargo_version             | False    | `''`      | Cargo: SemVer 2.0 release version to describe in place of every member's `0.0.0`; empty describes the checkout as committed |
-| python_version            | False    | `3.12`    | Python for the python backend's tools and environment; `3.11` or newer                                                      |
+| python_version            | False    | `3.12`    | Python for the python backend's tools and environment, and for merge mode; `3.11` or newer                                  |
 | cyclonedx_py_version      | False    | `7.5.0`   | `cyclonedx-bom` (`cyclonedx-py`) version for the python backend; `4.0.0` or newer                                           |
 
 <!-- markdownlint-enable MD013 -->
@@ -1136,18 +1139,21 @@ rather than quiet successes.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name               | Description                                                     |
-| ------------------ | --------------------------------------------------------------- |
-| sbom_json_path     | Path to generated JSON SBOM file                                |
-| sbom_xml_path      | Path to generated XML SBOM file                                 |
-| component_count    | Number of components in the generated SBOM                      |
-| backend            | SBOM generation backend used                                    |
-| dependency_manager | Build tool or package manager the backend drove                 |
-| skipped            | `true` when the action declined to generate                     |
-| image_count        | Image mode: number of images described                          |
-| sboms_json         | Image mode: JSON array describing each image SBOM               |
-| manifest_path      | Image mode: path to the manifest file                           |
-| artifact_paths     | Image mode: newline-separated files written, manifest included  |
+| Name                    | Description                                                           |
+| ----------------------- | --------------------------------------------------------------------- |
+| sbom_json_path          | Path to generated JSON SBOM file                                      |
+| sbom_xml_path           | Path to generated XML SBOM file                                       |
+| component_count         | Number of components in the generated SBOM                            |
+| backend                 | SBOM generation backend used                                          |
+| dependency_manager      | Build tool or package manager the backend drove                       |
+| skipped                 | `true` when the action declined to generate                           |
+| image_count             | Image mode: number of images described                                |
+| sboms_json              | Image mode: JSON array describing each image SBOM                     |
+| manifest_path           | Image mode: path to the manifest file                                 |
+| artifact_paths          | Image mode: newline-separated files written, manifest included        |
+| merge_bom_count         | Merge mode: number of module BOMs merged                              |
+| merge_module_count      | Merge mode: number of modules in the merged document                  |
+| merge_missing_bom_count | Merge mode: number of `pom.xml` directories with no `target/bom.json` |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -1159,6 +1165,9 @@ In image mode there is no single document, so `sbom_json_path` and
 `sbom_xml_path` stay empty and `component_count` reports the total
 across every image. The four image-mode outputs stay empty in directory
 mode. See [Container images](#container-images).
+
+The three merge-mode outputs stay empty unless a merge succeeded;
+see [merge mode](#maven-module-boms-merge-mode).
 
 `dependency_manager` reports the build system the `cyclonedx` backend
 drove, since the backend name identifies the tool rather than the build
@@ -1485,8 +1494,8 @@ stays put, so point `output_directory` at a fresh directory, or upload
 
 ### Specification version
 
-The action asks syft for the version in `sbom_spec_version` (default
-`1.5`). A bare `cyclonedx-json` output instead takes syft's own
+The action asks syft for the version in `sbom_spec_version` (`auto`
+means `1.5`). A bare `cyclonedx-json` output instead takes syft's own
 default, which moves with syft releases: syft 1.51.1, the version the
 pinned installer fetches, writes `1.7`. Set `sbom_spec_version` to
 match a consumer that needs a particular version.
@@ -1501,6 +1510,114 @@ archives, which leaves neither source available to them. To scan a
 registry image directly,
 [grype-scan-action](https://github.com/lfreleng-actions/grype-scan-action)
 accepts a `registry:` target.
+
+## Maven module BOMs (merge mode)
+
+`mode: merge` writes one CycloneDX JSON document from the
+`target/bom.json` files that a Maven build already wrote, one per
+module, through `cyclonedx-maven-plugin`'s `makeBom` goal. It runs no
+Maven of its own: the caller's build decides what each module BOM
+holds, and this mode joins them.
+
+```yaml
+- name: "Build"
+  run: mvn -B --no-transfer-progress install
+
+- name: "Merge module SBOMs"
+  uses: lfreleng-actions/sbom-action@main
+  with:
+    mode: merge
+    backend: cyclonedx
+    path_prefix: .
+```
+
+### Why a second Maven path
+
+The generate path runs `makeAggregateBom` over the reactor. That goal
+skips modules that skip deploy, and a root setting
+`maven.deploy.skip` once skipped the whole reactor
+([#103](https://github.com/lfreleng-actions/sbom-action/issues/103)).
+The generate path now retries such a reactor with
+`-Dcyclonedx.skipNotDeployed=false`. Merge mode differs from it in
+these ways:
+
+- It describes what the build that produced the artefacts resolved,
+  rather than a second Maven run.
+- It needs no JDK, no Maven and no network: the BOMs are already on
+  disk.
+- A module that skips deploy and writes no BOM of its own appears
+  as a scoped component of the modules depending on it, rather than
+  as a module. On opendaylight/netconf these are the shaded
+  jars, `shaded-sshd-jar` and `shaded-exificient-jar`.
+
+### Discovery
+
+The merge walks from `path_prefix`, which must resolve within the
+workspace. A module is a directory holding a `pom.xml` with a
+`target/bom.json` beside it. The walk prunes `target`, `.git` and
+`src/it` subtrees, the last being where `maven-invoker-plugin` runs
+its projects in place. A Maven repository inside the workspace holds
+`*.pom` files and never `pom.xml`, so it yields no false modules.
+Modules a reactor names beside its root (`../core`) need
+`path_prefix: .`.
+
+The merge skips, with a warning, a `target/bom.json` the repository
+tracks, or one that it reaches through a symbolic link (`target` or
+`bom.json` itself), since neither counts as this build's output. An
+`output_directory` and `filename_prefix` that name a module's
+`target/bom.json` fail the run before it clears that file. A
+`pom.xml` directory with no BOM counts towards
+`merge_missing_bom_count`; an aggregator root that does not bind
+`makeBom` lands there too. With no BOM at all the merge fails,
+honouring `fail_on_error`.
+
+### The merged document
+
+- Maven modules match on `group:artifact:version`, ignoring purl
+  qualifiers and subpath, so a `bundle` module and its attached
+  artefacts count as one module. Each module appears once, without a
+  scope.
+- Each third-party component appears once, at the strongest scope
+  any module gives it: `required` or absent, then `optional`, then
+  `excluded`. An absent scope, or one CycloneDX does not define,
+  ranks as `required`, and the merged document names it so. A
+  module is the one component left without a scope, since
+  grype-scan-action reads every unscoped component of a reactor
+  document as a module.
+- Dependency edges move onto the canonical module references and
+  merge; the merge drops self-edges.
+- One synthetic root, `reactor:<merge_root_name>`, with an empty
+  `dependsOn`, so that
+  [grype-scan-action](https://github.com/lfreleng-actions/grype-scan-action)
+  can tell direct from transitive findings.
+- `metadata.tools` comes from the module BOMs, naming
+  `cyclonedx-maven-plugin`. Where any BOM wraps its tools in the
+  CycloneDX 1.5 shape, entries another BOM lists in the deprecated
+  form join them as components.
+
+The document carries the module BOMs' `specVersion`. BOMs that mix
+versions fail the merge. With `sbom_spec_version` left at `auto` the
+merge takes their version; an explicit value asserts it, and a
+mismatch fails. A malformed BOM fails with an error naming the file,
+including one whose `components` or `dependencies` hold an entry that
+is not an object, or whose `bom-ref`, `ref` or `dependsOn` entries are
+not non-empty strings; the merge never drops such an entry.
+
+### Inputs in merge mode
+
+Merge mode needs `backend: cyclonedx`, and `dependency_manager` set to
+`maven` or to `auto`. With `auto` and no `pom.xml` at `path_prefix`,
+a Gradle or Cargo marker there fails the run. The action refuses the
+inputs that cannot apply rather than ignoring them: a non-empty
+`maven_args`, a non-empty `image_archive_directory`, `include_dev:
+true` (the project's own `makeBom` configuration decides test scope)
+and any `sbom_format` but `json` or `auto`. The Java, Gradle, Cargo
+and Python backend inputs keep their defaults unread, apart from
+`python_version`, which picks the interpreter that runs the merge. The
+JDK, syft and Cargo tool setup steps do not run.
+
+`backend` reports `cyclonedx` and `dependency_manager` reports
+`maven`.
 
 ## Migrating from python-sbom-action
 
@@ -1593,9 +1710,9 @@ when the audit fails:
 
 <!-- markdownlint-disable MD013 -->
 
-1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features`, `cargo_no_default_features`, `cargo_version`, `python_version` and `cyclonedx_py_version` inputs against restricted value sets before use, including that a declared `dependency_manager` belongs to the selected backend; verifies the project directory exists, or in image mode the archive directory, and that any `cargo_working_directory` lies within the project directory on a run that drives Cargo; and rejects image mode with any backend but `syft` and an archive directory set without image mode. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` and `python` backends this step also resolves the trust decision and the build system or package manager, failing fast on a project it cannot drive before installing any toolchain; for `cyclonedx` it skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
+1. **Input Validation**: Validates backend, mode, format, boolean flags, specification version, filename prefix, and the `java_version`, `java_distribution`, `maven_plugin_version`, `gradle_plugin_version`, `gradle_version`, `dependency_manager`, `untrusted_checkout`, `cargo_cyclonedx_version`, `cyclonedx_cli_version`, `cargo_target`, `cargo_features`, `cargo_all_features`, `cargo_no_default_features`, `cargo_version`, `python_version` and `cyclonedx_py_version` inputs against restricted value sets before use, including that a declared `dependency_manager` belongs to the selected backend; verifies the project directory exists, or in image mode the archive directory, and that any `cargo_working_directory` lies within the project directory on a run that drives Cargo; and rejects image mode with any backend but `syft` and an archive directory set without image mode. In merge mode it requires `backend: cyclonedx` and a Maven `dependency_manager`, rejects `maven_args`, `include_dev: true` and any format but JSON, and resolves `auto` for `sbom_format` and `sbom_spec_version`. `maven_args` and `gradle_args` are **not** constrained this way — the action splits each on whitespace and rejects them solely for selecting an alternate project or overriding action-owned properties, leaving them trusted input (see [Inputs](#inputs)). For the `cyclonedx` and `python` backends this step also resolves the trust decision and the build system or package manager, failing fast on a project it cannot drive before installing any toolchain; for `cyclonedx` it skips a Gradle version below the plugin's floor where the caller supplied one, and for Cargo requires `cargo` on `PATH` and a specification version `cargo-cyclonedx` can write
 2. **Toolchain Setup**: For the `syft` backend, fetches the syft binary via the pinned `anchore/sbom-action/download-syft` helper action. For the `cyclonedx` backend, installs a JDK via the pinned `actions/setup-java` for Maven and Gradle, or for Cargo installs `cargo-cyclonedx` (and `cyclonedx-cli` for XML output) via the pinned `taiki-e/install-action`. For the `python` backend, installs Python via the pinned `actions/setup-python` without changing the job's environment. The selected backend and build tool guard each step, so none costs anything when unused
-3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, writes any `cargo_version` over the members' `0.0.0` placeholder in place and restores the files afterwards, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. For Python, the action installs the package manager and `cyclonedx-bom` into environments of their own, checks the lock, installs the project's dependencies into a third environment, anchors the root on the project's `[project]` table, runs `cyclonedx-py environment` against that environment once, then gives every component the edges whose declaration applies, checks the result against the schema and writes both formats from that one document. In every case the JSON document always gets generated internally to compute the component count. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
+3. **SBOM Generation**: A single step dispatches on the backend, and the `cyclonedx` backend dispatches again on the build system. The `syft` backend runs one scan emitting the requested CycloneDX formats (`format@version=path` syntax). For Maven, the action invokes `cyclonedx-maven-plugin`'s `makeAggregateBom` goal directly, writing into the resolved output directory. For Gradle, an init script applies `cyclonedx-gradle-plugin` and runs `cyclonedxBom`, configuring the task destinations once Gradle finishes evaluating the consumer's build scripts, so that a consumer's own configuration cannot displace them. For Cargo, the action checks the lockfile with `cargo metadata --locked`, writes any `cargo_version` over the members' `0.0.0` placeholder in place and restores the files afterwards, runs `cargo-cyclonedx` under a scrubbed environment, merges the per-member documents of a workspace with `jq`, and converts the result to XML with `cyclonedx-cli` where requested. For Python, the action installs the package manager and `cyclonedx-bom` into environments of their own, checks the lock, installs the project's dependencies into a third environment, anchors the root on the project's `[project]` table, runs `cyclonedx-py environment` against that environment once, then gives every component the edges whose declaration applies, checks the result against the schema and writes both formats from that one document. In every case the JSON document always gets generated internally to compute the component count. In merge mode the step instead runs the `scripts.maven_merge` module from the action directory on the interpreter `actions/setup-python` provides, which merges the module BOMs under `path_prefix` into the JSON document. In image mode the step instead checks every archive against the contract, then runs one syft scan per archive (`docker-archive:` source, `--source-name` set to the image reference, or the label for an untagged image), verifies each document, and writes the manifest
 4. **Outputs and Summary**: Emits output paths for the requested formats, the component count, the build tool used, and a step summary, which for Cargo names the feature selection and any `cargo_version`; in image mode, the image count, manifest, its path, and the list of files written
 
 <!-- markdownlint-enable MD013 -->
