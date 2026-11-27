@@ -389,13 +389,106 @@ jobs:
           retention-days: '1'
 
       # The lanes download the archives in a separate job, so the test
-      # does too, landing them under RUNNER_TEMP outside the checkout
-      - name: "Download the archives as a lane would"
+      # does too, landing them under RUNNER_TEMP outside the checkout.
+      # The artifact service can fail to list an artifact for a moment
+      # after its upload (actions/download-artifact#505), so a failed
+      # download is retried: five attempts in all, waiting 2, 4, 8 and
+      # 16 seconds after attempts one to four. Each attempt after the
+      # first runs only when the one before it failed.
+      - name: "Download the archives as a lane would (attempt 1)"
+        id: download-1
+        continue-on-error: true
         # yamllint disable-line rule:line-length
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: 'sbom-action-image-archives'
           path: ${{ runner.temp }}/docker-archives
+
+      # Start each retry from an empty directory, so the later steps
+      # read the files of one attempt only
+      - name: "Wait before download attempt 2"
+        if: steps.download-1.outcome == 'failure'
+        shell: bash
+        run: |
+          # Wait before download attempt 2
+          rm -rf "${RUNNER_TEMP}/docker-archives"
+          sleep 2
+
+      - name: "Download the archives as a lane would (attempt 2)"
+        id: download-2
+        if: steps.download-1.outcome == 'failure'
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: 'sbom-action-image-archives'
+          path: ${{ runner.temp }}/docker-archives
+
+      - name: "Wait before download attempt 3"
+        if: steps.download-2.outcome == 'failure'
+        shell: bash
+        run: |
+          # Wait before download attempt 3
+          rm -rf "${RUNNER_TEMP}/docker-archives"
+          sleep 4
+
+      - name: "Download the archives as a lane would (attempt 3)"
+        id: download-3
+        if: steps.download-2.outcome == 'failure'
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: 'sbom-action-image-archives'
+          path: ${{ runner.temp }}/docker-archives
+
+      - name: "Wait before download attempt 4"
+        if: steps.download-3.outcome == 'failure'
+        shell: bash
+        run: |
+          # Wait before download attempt 4
+          rm -rf "${RUNNER_TEMP}/docker-archives"
+          sleep 8
+
+      - name: "Download the archives as a lane would (attempt 4)"
+        id: download-4
+        if: steps.download-3.outcome == 'failure'
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: 'sbom-action-image-archives'
+          path: ${{ runner.temp }}/docker-archives
+
+      - name: "Wait before download attempt 5"
+        if: steps.download-4.outcome == 'failure'
+        shell: bash
+        run: |
+          # Wait before download attempt 5
+          rm -rf "${RUNNER_TEMP}/docker-archives"
+          sleep 16
+
+      - name: "Download the archives as a lane would (attempt 5)"
+        id: download-5
+        if: steps.download-4.outcome == 'failure'
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: 'sbom-action-image-archives'
+          path: ${{ runner.temp }}/docker-archives
+
+      # Every later step reads the archives, and most carry
+      # continue-on-error, so stop the job here rather than let them
+      # report misleading results
+      - name: "Fail when every download attempt failed"
+        if: steps.download-5.outcome == 'failure'
+        shell: bash
+        run: |
+          # Fail when every download attempt failed
+          echo "::error::Unable to download artifact \
+          sbom-action-image-archives after 5 attempts"
+          exit 1
 
       - name: "Running local action: image mode, as the lanes use it"
         id: image
