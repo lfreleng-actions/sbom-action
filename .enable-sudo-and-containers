@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+#
+# Gives Code Monkey sessions on this repository sudo and Docker
+# (lfreleng-actions/github-code-monkey-bot, docs/DESIGN.md section 4.1).
+# Only this file's presence at the root of the default branch counts;
+# the bot never reads its content.
+#
+# Why: this action's tests build fixture images with docker build and
+# save them with docker save to check its image-archive input, and
+# install tools with sudo apt-get. A change to that path cannot be
+# checked unless the session can build images and use sudo.
+#
+# The grant also gives the session the means to undo harden-runner, so
+# remove this file once the repository no longer needs it.
