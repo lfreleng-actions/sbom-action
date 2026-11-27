@@ -197,6 +197,27 @@ jobs:
           filename_prefix: sbom-with-dev
           include_dev: 'true'
 
+      # sbom_format and sbom_spec_version default to 'auto', which
+      # outside merge mode must resolve to the defaults they carried
+      # before: 'both' and '1.5'. An explicit run gives the reference.
+      - name: "Running local action: format and version left to auto"
+        id: auto-defaults
+        uses: $/
+        with:
+          path_prefix: test-project
+          filename_prefix: sbom-auto
+          output_directory: auto-out
+
+      - name: "Running local action: format and version set explicitly"
+        id: explicit-defaults
+        uses: $/
+        with:
+          path_prefix: test-project
+          sbom_format: both
+          sbom_spec_version: '1.5'
+          filename_prefix: sbom-explicit
+          output_directory: explicit-out
+
       - name: "Verify format selection and scoping behaviour"
         shell: bash
         env:
@@ -206,9 +227,41 @@ jobs:
           XML_ONLY_JSON: ${{ steps.xml-only.outputs.sbom_json_path }}
           XML_ONLY_XML: ${{ steps.xml-only.outputs.sbom_xml_path }}
           WITH_DEV_COUNT: ${{ steps.with-dev.outputs.component_count }}
+          AUTO_JSON: ${{ steps.auto-defaults.outputs.sbom_json_path }}
+          AUTO_XML: ${{ steps.auto-defaults.outputs.sbom_xml_path }}
+          # yamllint disable-line rule:line-length
+          EXPLICIT_JSON: ${{ steps.explicit-defaults.outputs.sbom_json_path }}
+          # yamllint disable-line rule:line-length
+          EXPLICIT_XML: ${{ steps.explicit-defaults.outputs.sbom_xml_path }}
         run: |
           # Verify format selection and scoping behaviour
           errors=0
+          # 'auto' resolves to both formats at CycloneDX 1.5, and gives
+          # the document an explicit 'both' and '1.5' give, once the
+          # fields each run sets afresh are set aside
+          for path in "${AUTO_JSON}" "${AUTO_XML}" "${EXPLICIT_JSON}" \
+            "${EXPLICIT_XML}"; do
+            if [ ! -f "${path}" ]; then
+              echo "auto/explicit run: missing document '${path}' ❌"
+              errors=1
+            fi
+          done
+          if [ "${errors}" = "0" ]; then
+            if [ "$(jq -r '.specVersion' "${AUTO_JSON}")" != "1.5" ]; then
+              echo "auto did not resolve sbom_spec_version to 1.5 ❌"
+              errors=1
+            fi
+            if ! grep -q 'cyclonedx.org/schema/bom/1.5' "${AUTO_XML}"; then
+              echo "auto XML is not CycloneDX 1.5 ❌"
+              errors=1
+            fi
+            strip='del(.serialNumber, .metadata.timestamp)'
+            if ! cmp -s <(jq -S "${strip}" "${AUTO_JSON}") \
+              <(jq -S "${strip}" "${EXPLICIT_JSON}"); then
+              echo "auto and explicit defaults gave different JSON ❌"
+              errors=1
+            fi
+          fi
           if [ ! -f "${JSON_ONLY_JSON}" ]; then
             echo "JSON-only run: JSON SBOM missing ❌"
             errors=1
@@ -4633,6 +4686,238 @@ jobs:
           echo "Python backend options verified ✅"
           echo "Python backend options verified ✅" >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test merge mode on the module BOMs a Maven build wrote ###
+  # A reactor whose root skips deploy, as opendaylight/netconf's does,
+  # with modules that bind makeBom as odlparent binds it. The build
+  # writes the module BOMs; merge mode joins them into one document,
+  # and grype-scan-action's own classifier, pinned, must read that
+  # document's graph.
+  test-merge-mode:
+    name: "Test: merge mode"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
+
+      # The shared allow-list carries Maven Central and
+      # api.adoptium.net, as the cyclonedx backend's job needs.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout grype-scan-action"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/grype-scan-action
+          # yamllint disable-line rule:line-length
+          ref: e8005f67585645ecf0af87d83a05dedab214f00f # v0.6.3
+          path: grype-scan-action
+          persist-credentials: false
+
+      - name: "Set up JDK"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          java-version: '21'
+          distribution: temurin
+          overwrite-settings: false
+
+      - name: "Set up Python"
+        id: python
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          update-environment: false
+
+      # The modules have no parent, so the root's maven.deploy.skip
+      # stays the root's own, as with odlparent's aggregators. api
+      # declares slf4j-api; app declares api. The root writes no BOM.
+      - name: "Create a reactor whose modules bind makeBom"
+        shell: bash
+        run: |
+          # Create a reactor whose modules bind makeBom
+          mkdir -p merge-reactor/api merge-reactor/app
+          cat > merge-reactor/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.lfreleng.test</groupId>
+            <artifactId>merge-root</artifactId>
+            <version>1.0.0</version>
+            <packaging>pom</packaging>
+            <properties>
+              <maven.deploy.skip>true</maven.deploy.skip>
+            </properties>
+            <modules>
+              <module>api</module>
+              <module>app</module>
+            </modules>
+          </project>
+          POMEOF
+          for module in api app; do
+            if [ "${module}" = "api" ]; then
+              dependency='<groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>2.0.17</version>'
+            else
+              dependency='<groupId>org.lfreleng.test</groupId>
+                <artifactId>merge-api</artifactId>
+                <version>1.0.0</version>'
+            fi
+            cat > "merge-reactor/${module}/pom.xml" <<POMEOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.lfreleng.test</groupId>
+            <artifactId>merge-${module}</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.release>17</maven.compiler.release>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <dependencies>
+              <dependency>
+                ${dependency}
+              </dependency>
+            </dependencies>
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.cyclonedx</groupId>
+                  <artifactId>cyclonedx-maven-plugin</artifactId>
+                  <version>2.9.1</version>
+                  <executions>
+                    <execution>
+                      <phase>package</phase>
+                      <goals>
+                        <goal>makeBom</goal>
+                      </goals>
+                    </execution>
+                  </executions>
+                  <configuration>
+                    <outputFormat>json</outputFormat>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POMEOF
+          done
+
+      - name: "Build the reactor"
+        shell: bash
+        run: |
+          # Build the reactor
+          mvn -B --no-transfer-progress -f merge-reactor/pom.xml package
+
+      # Merge mode runs nothing from the checkout, so an untrusted
+      # checkout must not skip it.
+      - name: "Running local action: merge mode"
+        id: merge
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-reactor
+          filename_prefix: sbom-merge
+          untrusted_checkout: 'true'
+
+      - name: "Verify the merged document"
+        shell: bash
+        env:
+          PYTHON_CMD: ${{ steps.python.outputs.python-path }}
+          JSON_PATH: ${{ steps.merge.outputs.sbom_json_path }}
+          XML_PATH: ${{ steps.merge.outputs.sbom_xml_path }}
+          COMPONENT_COUNT: ${{ steps.merge.outputs.component_count }}
+          BACKEND: ${{ steps.merge.outputs.backend }}
+          MANAGER: ${{ steps.merge.outputs.dependency_manager }}
+          SKIPPED: ${{ steps.merge.outputs.skipped }}
+          BOM_COUNT: ${{ steps.merge.outputs.merge_bom_count }}
+          MODULE_COUNT: ${{ steps.merge.outputs.merge_module_count }}
+          # yamllint disable-line rule:line-length
+          MISSING_COUNT: ${{ steps.merge.outputs.merge_missing_bom_count }}
+        run: |
+          # Verify the merged document
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "$1: got '$2', wanted '$3' ❌"
+              errors=1
+            fi
+          }
+          check backend "${BACKEND}" cyclonedx
+          check dependency_manager "${MANAGER}" maven
+          check skipped "${SKIPPED}" false
+          check merge_bom_count "${BOM_COUNT}" 2
+          check merge_module_count "${MODULE_COUNT}" 2
+          check merge_missing_bom_count "${MISSING_COUNT}" 1
+          check component_count "${COMPONENT_COUNT}" 3
+          check sbom_xml_path "${XML_PATH}" ""
+          if [ ! -f "${JSON_PATH}" ]; then
+            echo "No merged document at '${JSON_PATH}' ❌"
+            exit 1
+          fi
+          check specVersion "$(jq -r '.specVersion' "${JSON_PATH}")" 1.6
+          check root "$(jq -r '.metadata.component["bom-ref"]' \
+            "${JSON_PATH}")" "reactor:${GITHUB_REPOSITORY}"
+          # Each module once and unscoped, each library scoped, and
+          # every edge between components the document lists
+          check modules "$(jq -c '[.components[]
+            | select(.scope == null) | .name] | sort' "${JSON_PATH}")" \
+            '["merge-api","merge-app"]'
+          check duplicates "$(jq '[.components[]["bom-ref"]]
+            | length - (unique | length)' "${JSON_PATH}")" 0
+          check dangling "$(jq '([.components[]["bom-ref"]]
+            + [.metadata.component["bom-ref"]]) as $known
+            | [.dependencies[] | .ref, .dependsOn[]]
+            | map(select(. as $ref | $known | index($ref) | not))
+            | length' "${JSON_PATH}")" 0
+          # grype-scan-action reads the graph only from a document whose
+          # generator and schema it has measured; anything else falls
+          # back to classifying every finding as direct
+          cat > "${RUNNER_TEMP}/classify.py" <<'PYEOF'
+          import sys
+
+          sys.path.insert(0, sys.argv[1])
+          from scripts.cyclonedx import load_document
+          from scripts.provenance import classify_document
+
+          classes, source = classify_document(load_document(sys.argv[2]))
+          print(source)
+          for ref, verdict in sorted(classes.items()):
+              print(f"  {verdict}: {ref}")
+          PYEOF
+          classified="$("${PYTHON_CMD}" -I "${RUNNER_TEMP}/classify.py" \
+            "${GITHUB_WORKSPACE}/grype-scan-action" "${JSON_PATH}")"
+          echo "${classified}"
+          check classify_document "$(head -1 <<< "${classified}")" \
+            sbom-graph
+          if [ "${errors}" != "0" ]; then
+            echo "Merge mode verification failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Merge mode verified ✅"
+          echo "Merge mode verified ✅" >> "$GITHUB_STEP_SUMMARY"
+
   ### Test invalid inputs fail closed ###
   test-failures:
     name: "Test: invalid inputs and error handling"
@@ -5105,6 +5390,160 @@ jobs:
           filename_prefix: sbom-deployskip-goal
           maven_args: 'clean'
 
+      # Merge mode reads the module BOMs a Maven build wrote, so it
+      # refuses every other backend and build tool, the inputs that
+      # shape a build it does not run, and any format but JSON. Its
+      # fixtures are written here: one module BOM at CycloneDX 1.6, a
+      # Maven project that wrote none, and a Gradle project.
+      - name: "Create merge mode fixtures"
+        shell: bash
+        run: |
+          # Create merge mode fixtures
+          mkdir -p merge-one/target merge-none merge-gradle
+          touch merge-one/pom.xml merge-none/pom.xml
+          touch merge-gradle/build.gradle
+          cat > merge-one/target/bom.json <<'BOMEOF'
+          {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "version": 1,
+            "metadata": {
+              "component": {
+                "type": "library",
+                "bom-ref": "pkg:maven/org.lfreleng.test/one@1.0.0?type=jar",
+                "name": "one"
+              }
+            },
+            "components": [],
+            "dependencies": []
+          }
+          BOMEOF
+
+      - name: "Merge mode on the syft backend"
+        id: merge-syft
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          path_prefix: merge-one
+
+      - name: "Merge mode driving Gradle"
+        id: merge-gradle-manager
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          dependency_manager: gradle
+          path_prefix: merge-one
+
+      - name: "Merge mode with auto finding a Gradle project"
+        id: merge-gradle-auto
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-gradle
+
+      - name: "Merge mode with maven_args"
+        id: merge-maven-args
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          maven_args: '-q'
+
+      - name: "Merge mode with include_dev"
+        id: merge-include-dev
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          include_dev: 'true'
+
+      - name: "Merge mode with an image archive directory"
+        id: merge-image-directory
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          image_archive_directory: merge-one
+
+      - name: "Merge mode asking for XML"
+        id: merge-xml
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          sbom_format: xml
+
+      - name: "Merge mode asking for both formats"
+        id: merge-both
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          sbom_format: both
+
+      # An explicit version is an assertion about the module BOMs,
+      # which here carry 1.6
+      - name: "Merge mode with a mismatched spec version"
+        id: merge-spec-mismatch
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          sbom_spec_version: '1.5'
+          filename_prefix: sbom-merge-mismatch
+
+      - name: "Merge mode with no module BOM"
+        id: merge-no-bom
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-none
+          filename_prefix: sbom-merge-none
+
+      - name: "Merge mode with no module BOM, fail_on_error false"
+        id: merge-no-bom-soft
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-none
+          filename_prefix: sbom-merge-none-soft
+          fail_on_error: 'false'
+
+      # A destination on a module's target/bom.json would have the
+      # clearing delete the merge's own input; the run must refuse
+      # before it touches the file.
+      - name: "Merge mode writing over a module BOM"
+        id: merge-over-input
+        continue-on-error: true
+        uses: $/
+        with:
+          mode: merge
+          backend: cyclonedx
+          path_prefix: merge-one
+          output_directory: merge-one/target
+          filename_prefix: bom
+
       # The destinations derive from filename_prefix and
       # output_directory, both caller-controlled and both defaulting
       # into the workspace. Clearing them must never unlink a project
@@ -5436,6 +5875,29 @@ jobs:
           DEPLOY_SKIP_QUIET_CALLER_OUTCOME: ${{ steps.deploy-skip-quiet-caller.outcome }}
           # yamllint disable-line rule:line-length
           DEPLOY_SKIP_GOAL_OUTCOME: ${{ steps.deploy-skip-goal.outcome }}
+          MERGE_SYFT_OUTCOME: ${{ steps.merge-syft.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_GRADLE_MANAGER_OUTCOME: ${{ steps.merge-gradle-manager.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_GRADLE_AUTO_OUTCOME: ${{ steps.merge-gradle-auto.outcome }}
+          MERGE_MAVEN_ARGS_OUTCOME: ${{ steps.merge-maven-args.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_INCLUDE_DEV_OUTCOME: ${{ steps.merge-include-dev.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_IMAGE_DIR_OUTCOME: ${{ steps.merge-image-directory.outcome }}
+          MERGE_XML_OUTCOME: ${{ steps.merge-xml.outcome }}
+          MERGE_BOTH_OUTCOME: ${{ steps.merge-both.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_SPEC_MISMATCH_OUTCOME: ${{ steps.merge-spec-mismatch.outcome }}
+          MERGE_NO_BOM_OUTCOME: ${{ steps.merge-no-bom.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_NO_BOM_SOFT_OUTCOME: ${{ steps.merge-no-bom-soft.outcome }}
+          # yamllint disable-line rule:line-length
+          MERGE_NO_BOM_SOFT_COUNT: ${{ steps.merge-no-bom-soft.outputs.component_count }}
+          # yamllint disable-line rule:line-length
+          MERGE_NO_BOM_SOFT_BOMS: ${{ steps.merge-no-bom-soft.outputs.merge_bom_count }}
+          # yamllint disable-line rule:line-length
+          MERGE_OVER_INPUT_OUTCOME: ${{ steps.merge-over-input.outcome }}
           COLLIDE_OUTCOME: ${{ steps.collide.outcome }}
           COLLIDE_DECOY_OUTCOME: ${{ steps.collide-decoy.outcome }}
           # yamllint disable-line rule:line-length
@@ -5492,6 +5954,17 @@ jobs:
             "deploy-skip-caller:${DEPLOY_SKIP_CALLER_OUTCOME}" \
             "deploy-skip-quiet-caller:${DEPLOY_SKIP_QUIET_CALLER_OUTCOME}" \
             "deploy-skip-goal:${DEPLOY_SKIP_GOAL_OUTCOME}" \
+            "merge-syft:${MERGE_SYFT_OUTCOME}" \
+            "merge-gradle-manager:${MERGE_GRADLE_MANAGER_OUTCOME}" \
+            "merge-gradle-auto:${MERGE_GRADLE_AUTO_OUTCOME}" \
+            "merge-maven-args:${MERGE_MAVEN_ARGS_OUTCOME}" \
+            "merge-include-dev:${MERGE_INCLUDE_DEV_OUTCOME}" \
+            "merge-image-directory:${MERGE_IMAGE_DIR_OUTCOME}" \
+            "merge-xml:${MERGE_XML_OUTCOME}" \
+            "merge-both:${MERGE_BOTH_OUTCOME}" \
+            "merge-spec-mismatch:${MERGE_SPEC_MISMATCH_OUTCOME}" \
+            "merge-no-bom:${MERGE_NO_BOM_OUTCOME}" \
+            "merge-over-input:${MERGE_OVER_INPUT_OUTCOME}" \
             "hard-fail:${HARD_FAIL_OUTCOME}"; do
             test_name="${outcome_pair%%:*}"
             outcome="${outcome_pair#*:}"
@@ -5603,6 +6076,27 @@ jobs:
           elif ! jq -e '[.components[]?.name] | index("deploy-skip-app")' \
             "${DEPLOY_SKIP_QUIET_JSON}" > /dev/null; then
             echo "Quiet root-skip SBOM is missing the app module ❌"
+            errors=1
+          fi
+
+          # A merge that finds no module BOM honours fail_on_error like
+          # any other generation failure, and writes nothing
+          if [ "${MERGE_NO_BOM_SOFT_OUTCOME}" != "success" ] || \
+            [ "${MERGE_NO_BOM_SOFT_COUNT}" != "0" ] || \
+            [ -n "${MERGE_NO_BOM_SOFT_BOMS}" ]; then
+            echo "Merge with no BOM ignored fail_on_error: false" \
+              "(${MERGE_NO_BOM_SOFT_OUTCOME}," \
+              "count '${MERGE_NO_BOM_SOFT_COUNT}'," \
+              "BOMs '${MERGE_NO_BOM_SOFT_BOMS}') ❌"
+            errors=1
+          fi
+          if [ -n "$(find . -maxdepth 1 -name 'sbom-merge-*' \
+            2>/dev/null)" ]; then
+            echo "A failed merge left a document behind ❌"
+            errors=1
+          fi
+          if [ ! -f merge-one/target/bom.json ]; then
+            echo "A merge refused over a module BOM deleted it ❌"
             errors=1
           fi
 
